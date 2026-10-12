@@ -4,11 +4,11 @@ Enjin Visual Novel (gaya Artemis) - versi GitHub + Render
 Enjin asal, ditulis dari awal. BUKAN pelaksanaan format Artemis sebenar.
 
 Cara kerja:
-  1. Upload game sebagai .zip ke GitHub (folder `games/` dalam repo, atau sebagai Release asset).
-  2. Pemain membuka laman web -> senarai zip dikesan automatik.
-  3. Pemain tekan "Muat turun & main" -> server muat turun zip ke CACHE, ekstrak,
-     dan game terus dimainkan di web sebaik siap.
-  4. Butang "Padam cache" membuang game yang sudah dimuat turun.
+  A. UPLOAD TERUS: seret / pilih fail .zip atau .7z di laman web. Server ekstrak dan game
+     terus dimainkan; kawan anda buka pautan yang sama dan boleh main game itu juga.
+  B. GITHUB (pilihan): upload .zip/.7z ke GitHub (folder `games/` atau Release asset);
+     senarai dikesan automatik, tekan "Muat turun & main".
+  Butang "Padam cache" membuang game daripada server.
 
 Pembolehubah persekitaran (Render -> Environment):
   GITHUB_REPO         wajib untuk sumber GitHub, cth. "namaanda/vn-games"
@@ -16,11 +16,13 @@ Pembolehubah persekitaran (Render -> Environment):
   GITHUB_BRANCH       cabang (lalai: cabang asal repo)
   GITHUB_USE_RELEASES "1" (lalai) untuk turut baca Release assets
   GITHUB_TOKEN        pilihan: untuk repo persendirian / elak had kadar API
+  ADMIN_PASSWORD      pilihan: jika ditetapkan, upload & padam memerlukan kata laluan ini
+                      (bermain tetap bebas untuk semua orang)
   CACHE_DIR           lokasi cache (lalai: ./cache)
-  MAX_DOWNLOAD_MB     had saiz zip (lalai 1500)
+  MAX_DOWNLOAD_MB     had saiz arkib upload/muat turun (lalai 1500)
   MAX_UNZIPPED_MB     had saiz selepas ekstrak (lalai 3000)
 
-Dalam zip, folder game mesti mengandungi skrip .vn (terus, atau dalam scripts/) dan
+Dalam arkib (.zip atau .7z), folder game mesti mengandungi skrip .vn (terus, atau dalam scripts/) dan
 aset (terus, atau dalam assets/). Zip boleh ada satu folder induk. Lihat format skrip di bawah.
 
 Format skrip (.vn):
@@ -40,10 +42,11 @@ Format skrip (.vn):
     Nama: dialog               (tanpa "Nama:" = naratif)
 
 Jalankan setempat:  pip install -r requirements.txt && python app.py
-Pada Render:        gunicorn app:app --workers 1 --threads 8 --timeout 120
+Pada Render:        gunicorn app:app --workers 1 --threads 8 --timeout 300
 """
 import os
 import re
+import hmac
 import json
 import shutil
 import threading
@@ -51,6 +54,7 @@ import time
 import zipfile
 from pathlib import Path
 
+import py7zr
 import requests
 from flask import Flask, Response, abort, jsonify, request, send_from_directory
 
@@ -62,6 +66,7 @@ GH_PATH = os.environ.get("GITHUB_GAMES_PATH", "games").strip("/ ")
 GH_BRANCH = os.environ.get("GITHUB_BRANCH", "").strip()
 GH_RELEASES = os.environ.get("GITHUB_USE_RELEASES", "1") != "0"
 GH_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+ADMIN = os.environ.get("ADMIN_PASSWORD", "")
 MAX_DL = int(os.environ.get("MAX_DOWNLOAD_MB", "1500")) * 1024 * 1024
 MAX_UNZIP = int(os.environ.get("MAX_UNZIPPED_MB", "3000")) * 1024 * 1024
 LIST_TTL = 45  # saat; elak melebihi had kadar API GitHub
@@ -179,7 +184,7 @@ def find_root(base, max_depth=3):
 
 # ------------------------------------------------------------- sumber GitHub
 def slug(name):
-    stem = re.sub(r"\.zip$", "", name, flags=re.I)
+    stem = re.sub(r"\.(zip|7z)$", "", name, flags=re.I)
     return re.sub(r"[^\w\-]+", "-", stem).strip("-").lower() or "game"
 
 
@@ -204,11 +209,11 @@ def fetch_sources():
     items, errors = {}, []
 
     def add(name, size, source, **kw):
-        if not name.lower().endswith(".zip"):
+        if not re.search(r"\.(zip|7z)$", name, re.I):
             return
         gid = slug(name)
         if gid not in items:
-            items[gid] = {"id": gid, "name": re.sub(r"\.zip$", "", name, flags=re.I),
+            items[gid] = {"id": gid, "name": re.sub(r"\.(zip|7z)$", "", name, flags=re.I),
                           "size": size, "source": source, **kw}
 
     if GH_REPO:
@@ -238,7 +243,7 @@ def fetch_sources():
             except Exception as e:
                 errors.append(f"Repo: {e}")
     if LOCAL_ZIPS.is_dir():
-        for z in sorted(LOCAL_ZIPS.glob("*.zip")):
+        for z in sorted(LOCAL_ZIPS.iterdir()):
             add(z.name, z.stat().st_size, "local", path=str(z))
     return items, "; ".join(errors)
 
@@ -276,22 +281,83 @@ def game_root(gid):
     return CACHE / gid / "files" / m["root"]
 
 
-def safe_extract(zpath, out):
+def sniff(path):
+    with open(path, "rb") as f:
+        h = f.read(6)
+    if h[:2] == b"PK":
+        return "zip"
+    if h == b"7z\xbc\xaf\x27\x1c":
+        return "7z"
+    return None
+
+
+def bad_path(out_r, name):
+    t = (out_r / name).resolve()
+    return Path(name).is_absolute() or (t != out_r and out_r not in t.parents)
+
+
+def safe_extract(apath, out):
+    """Ekstrak .zip atau .7z dengan selamat. Pulangkan jumlah bait."""
+    kind = sniff(apath)
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     out_r = out.resolve()
-    with zipfile.ZipFile(zpath) as z:
-        infos = [i for i in z.infolist() if not i.filename.startswith("__MACOSX")]
-        total = sum(i.file_size for i in infos)
-        if total > MAX_UNZIP:
-            raise ValueError("Saiz selepas ekstrak melebihi had.")
-        for i in infos:
-            t = (out / i.filename).resolve()
-            if t != out_r and out_r not in t.parents:
-                raise ValueError("Zip mengandungi laluan tidak selamat.")
-        for i in infos:
-            z.extract(i, out)
-    return total
+    if kind == "zip":
+        with zipfile.ZipFile(apath) as z:
+            infos = [i for i in z.infolist() if not i.filename.startswith("__MACOSX")]
+            total = sum(i.file_size for i in infos)
+            if total > MAX_UNZIP:
+                raise ValueError("Saiz selepas ekstrak melebihi had.")
+            for i in infos:
+                if bad_path(out_r, i.filename):
+                    raise ValueError("Arkib mengandungi laluan tidak selamat.")
+            for i in infos:
+                z.extract(i, out)
+        return total
+    if kind == "7z":
+        with py7zr.SevenZipFile(apath, "r") as a:
+            files = a.files
+            total = sum(getattr(f, "uncompressed", 0) or 0 for f in files)
+            if total > MAX_UNZIP:
+                raise ValueError("Saiz selepas ekstrak melebihi had.")
+            for f in files:
+                if bad_path(out_r, f.filename) or getattr(f, "is_symlink", False):
+                    raise ValueError("Arkib mengandungi laluan tidak selamat.")
+            a.extractall(path=out)
+        return total
+    raise ValueError("Fail bukan arkib .zip atau .7z yang sah.")
+
+
+def finalize(gid, job, tmp, apath, name, source):
+    """Ekstrak arkib dalam tmp, cari root game, dan letak ke cache."""
+    if not sniff(apath):
+        raise ValueError("Fail bukan arkib .zip atau .7z yang sah.")
+    job["state"] = "extracting"
+    size = safe_extract(apath, tmp / "files")
+    Path(apath).unlink()
+    root = find_root(tmp / "files")
+    if root is None:
+        raise ValueError("Tiada fail .vn dijumpai dalam arkib (letak skrip dalam scripts/ atau terus di root).")
+    meta = {"name": name, "root": str(root.relative_to(tmp / "files")) or ".",
+            "size": size, "time": int(time.time()), "source": source}
+    (tmp / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    final = CACHE / gid
+    shutil.rmtree(final, ignore_errors=True)
+    tmp.rename(final)
+    job["state"] = "ready"
+
+
+def fail(job, tmp, e):
+    job["state"] = "error"
+    job["error"] = str(e)[:300]
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_extract(gid, tmp, apath, name, source):
+    try:
+        finalize(gid, JOBS[gid], tmp, apath, name, source)
+    except Exception as e:
+        fail(JOBS[gid], tmp, e)
 
 
 def run_download(gid, item):
@@ -300,11 +366,11 @@ def run_download(gid, item):
     try:
         shutil.rmtree(tmp, ignore_errors=True)
         tmp.mkdir(parents=True)
-        zpath = tmp / "game.zip"
+        apath = tmp / "game.bin"
         if item["source"] == "local":
             src = Path(item["path"])
             job["total"] = src.stat().st_size
-            with open(src, "rb") as fi, open(zpath, "wb") as fo:
+            with open(src, "rb") as fi, open(apath, "wb") as fo:
                 while chunk := fi.read(1 << 20):
                     fo.write(chunk)
                     job["done"] += len(chunk)
@@ -315,32 +381,16 @@ def run_download(gid, item):
                 r.raise_for_status()
                 job["total"] = int(r.headers.get("Content-Length") or item.get("size") or 0)
                 if job["total"] > MAX_DL:
-                    raise ValueError("Saiz zip melebihi had muat turun.")
-                with open(zpath, "wb") as fo:
+                    raise ValueError("Saiz arkib melebihi had muat turun.")
+                with open(apath, "wb") as fo:
                     for chunk in r.iter_content(1 << 18):
                         fo.write(chunk)
                         job["done"] += len(chunk)
                         if job["done"] > MAX_DL:
-                            raise ValueError("Saiz zip melebihi had muat turun.")
-        if not zipfile.is_zipfile(zpath):
-            raise ValueError("Fail yang dimuat turun bukan zip yang sah.")
-        job["state"] = "extracting"
-        size = safe_extract(zpath, tmp / "files")
-        zpath.unlink()
-        root = find_root(tmp / "files")
-        if root is None:
-            raise ValueError("Tiada fail .vn dijumpai dalam zip (letak skrip dalam scripts/ atau terus di root).")
-        meta = {"name": item["name"], "root": str(root.relative_to(tmp / "files")) or ".",
-                "size": size, "time": int(time.time())}
-        (tmp / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
-        final = CACHE / gid
-        shutil.rmtree(final, ignore_errors=True)
-        tmp.rename(final)
-        job["state"] = "ready"
+                            raise ValueError("Saiz arkib melebihi had muat turun.")
+        finalize(gid, job, tmp, apath, item["name"], item["source"])
     except Exception as e:
-        job["state"] = "error"
-        job["error"] = str(e)[:300]
-        shutil.rmtree(tmp, ignore_errors=True)
+        fail(job, tmp, e)
 
 
 def start_download(gid):
@@ -355,7 +405,8 @@ def start_download(gid):
             return job, None
         if cached_meta(gid):
             return {"state": "ready"}, None
-        JOBS[gid] = {"state": "downloading", "done": 0, "total": items[gid].get("size") or 0, "error": ""}
+        JOBS[gid] = {"state": "downloading", "done": 0, "total": items[gid].get("size") or 0, "error": "",
+                     "name": items[gid]["name"], "source": items[gid]["source"]}
         threading.Thread(target=run_download, args=(gid, items[gid]), daemon=True).start()
         return JOBS[gid], None
 
@@ -367,6 +418,55 @@ def busy(gid):
 
 # ------------------------------------------------------------------- aplikasi
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_DL + (1 << 20)
+
+
+def deny():
+    """Semak kata laluan admin (jika ditetapkan). Pulangkan respons ralat atau None."""
+    if not ADMIN:
+        return None
+    given = request.headers.get("X-Admin-Password", "")
+    if hmac.compare_digest(given.encode(), ADMIN.encode()):
+        return None
+    return jsonify(error="Kata laluan admin diperlukan atau salah."), 403
+
+
+@app.errorhandler(413)
+def too_large(_):
+    return jsonify(error=f"Fail terlalu besar (had {MAX_DL // 1048576} MB)."), 413
+
+
+@app.post("/api/upload")
+def api_upload():
+    d = deny()
+    if d:
+        return d
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify(error="Tiada fail dihantar."), 400
+    fname = Path(f.filename.replace("\\", "/")).name
+    if not re.search(r"\.(zip|7z)$", fname, re.I):
+        return jsonify(error="Hanya fail .zip atau .7z diterima."), 400
+    stem = re.sub(r"\.(zip|7z)$", "", fname, flags=re.I)
+    base, n = slug(fname), 1
+    with JOBS_LOCK:
+        gid = base
+        while busy(gid) or (CACHE / gid).exists() or (gid in JOBS and JOBS[gid]["state"] == "error"):
+            n += 1
+            gid = f"{base}-{n}"
+        name = stem if n == 1 else f"{stem} ({n})"
+        JOBS[gid] = {"state": "extracting", "done": 0, "total": 0, "error": "", "name": name, "source": "upload"}
+    tmp = CACHE / f".{gid}.tmp"
+    try:
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        apath = tmp / "game.bin"
+        f.save(apath)
+    except Exception as e:
+        fail(JOBS[gid], tmp, e)
+        return jsonify(error="Gagal menyimpan fail."), 500
+    threading.Thread(target=run_extract, args=(gid, tmp, apath, name, "upload"), daemon=True).start()
+    return jsonify(id=gid, name=name)
 
 
 @app.get("/api/games")
@@ -379,7 +479,11 @@ def api_games():
         if d.is_dir() and not d.name.startswith(".") and d.name not in games:
             m = cached_meta(d.name)
             if m:
-                games[d.name] = {"id": d.name, "name": m["name"], "size": 0, "source": "cache"}
+                games[d.name] = {"id": d.name, "name": m["name"], "size": 0,
+                                 "source": m.get("source", "cache") if m.get("source") == "upload" else "cache"}
+    for gid, j in list(JOBS.items()):  # kerja upload yang belum/tidak siap
+        if gid not in games:
+            games[gid] = {"id": gid, "name": j.get("name", gid), "size": 0, "source": j.get("source", "upload")}
     out = []
     for gid, g in sorted(games.items()):
         m = cached_meta(gid)
@@ -392,7 +496,7 @@ def api_games():
             g.update(state="none", done=0, total=0, error="")
         g["cached_size"] = m["size"] if m else 0
         out.append(g)
-    return jsonify(games=out, error=err, repo=GH_REPO)
+    return jsonify(games=out, error=err, repo=GH_REPO, locked=bool(ADMIN))
 
 
 @app.post("/api/games/<gid>/download")
@@ -407,6 +511,9 @@ def api_download(gid):
 
 @app.delete("/api/games/<gid>/cache")
 def api_delete(gid):
+    d = deny()
+    if d:
+        return d
     if not SAFE.match(gid):
         abort(400)
     if busy(gid):
@@ -418,6 +525,9 @@ def api_delete(gid):
 
 @app.delete("/api/cache")
 def api_delete_all():
+    d = deny()
+    if d:
+        return d
     if any(busy(g) for g in list(JOBS)):
         return jsonify(error="Ada muat turun sedang berjalan."), 409
     for d in CACHE.iterdir():
@@ -511,6 +621,15 @@ button:focus-visible,.opt:focus-visible{outline:2px solid var(--edge);outline-of
 .acts button:disabled{opacity:.5;cursor:default}
 .acts .del{color:var(--bad);border-color:var(--bad)}
 .acts .del:hover:not(:disabled){background:var(--bad);color:#1a1530}
+#drop{border:1px dashed var(--dim);padding:1.2vw 1.6vw;margin-bottom:1.4vw;font-size:max(13px,1.3vw);line-height:1.6}
+#drop.over{border-color:var(--edge);background:rgba(201,168,92,.08)}
+#drop button{font-size:max(12px,1.2vw);padding:.4vw 1.1vw;background:none;color:var(--edge);border:1px solid var(--edge);cursor:pointer}
+#drop button:hover{background:var(--edge);color:#1a1530}
+#drop small{display:block;color:var(--dim);font-size:max(11px,1vw)}
+#upProg{display:none;margin-top:.8vw}
+#upMsg{margin-top:.5vw;font-size:max(12px,1.1vw);color:var(--dim)}#upMsg.err{color:var(--bad)}
+#adminRow{display:none;margin-bottom:1.2vw}
+#adminPw{font-size:max(12px,1.2vw);padding:.4vw .8vw;background:var(--panel);color:var(--ink);border:1px solid var(--dim);width:min(100%,22em)}
 .prog{grid-column:1/-1;height:.45vw;min-height:4px;background:rgba(255,255,255,.1);display:none}
 .prog i{display:block;height:100%;width:0;background:var(--edge);transition:width .3s}
 .libtools{display:flex;gap:.6vw;margin-top:1.2vw}
@@ -536,6 +655,11 @@ button:focus-visible,.opt:focus-visible{outline:2px solid var(--edge);outline-of
   <div class="ov" id="lib" style="display:block">
     <button class="close" id="bBack" style="display:none">Kembali ke game</button>
     <h1>Enjin VN</h1><div id="libSub"></div><div id="libErr"></div>
+    <div id="drop"><b>Upload game</b>: seret fail <b>.zip</b> atau <b>.7z</b> ke sini, atau
+      <button id="bUp">pilih fail</button><input type="file" id="fileIn" accept=".zip,.7z" hidden>
+      <small>Arkib mesti mengandungi folder game dengan skrip .vn. Semua pengunjung boleh main game yang diupload.</small>
+      <div class="prog" id="upProg"><i></i></div><div id="upMsg"></div></div>
+    <div id="adminRow"><input type="password" id="adminPw" placeholder="Kata laluan admin (untuk upload / padam)" autocomplete="off"></div>
     <div id="libList"></div><div id="libEmpty"></div>
     <div class="libtools"><button id="bRefresh">Muat semula senarai</button><button id="bClearAll">Padam semua cache</button></div>
   </div>
@@ -663,7 +787,7 @@ function openLog(){
 
 // ================= perpustakaan: kesan, muat turun, cache =================
 const rows={};let wantPlay=null,libTimer=null;
-const SRC={github:'GitHub',release:'GitHub Release',local:'Tempatan',cache:'Hanya dalam cache'};
+const SRC={github:'GitHub',release:'GitHub Release',local:'Tempatan',cache:'Dalam cache',upload:'Diupload'};
 const libOpen=()=>$('#lib').style.display==='block';
 
 function makeRow(g){
@@ -684,24 +808,28 @@ function updRow(g){
   else if(g.state==='ready'){m=`Dalam cache, ${fmt(g.cached_size)}`}
   else if(g.state==='error'){m='Ralat: '+g.error;r.gm.className='gm err'}
   else{m=(g.size?fmt(g.size)+', ':'')+src+', belum dimuat turun'}
+  if(g.state==='extracting'&&!g.total)m='Mengekstrak fail...';
   r.gm.textContent=m;
   const active=g.state==='downloading'||g.state==='extracting';
   r.prog.style.display=active?'block':'none';
   r.bar.style.width=(g.state==='extracting'?100:pct)+'%';
   r.main.textContent=({none:'Muat turun & main',downloading:'Memuat turun...',extracting:'Mengekstrak...',ready:'Main',error:'Cuba lagi'})[g.state];
   r.main.disabled=active;
-  r.del.style.display=(g.state==='ready')?'':'none';
+  r.main.style.display=(g.state==='error'&&g.source==='upload')?'none':'';
+  r.del.textContent=g.state==='error'?'Buang':'Padam cache';
+  r.del.style.display=(g.state==='ready'||g.state==='error')?'':'none';
   r.del.disabled=active;
 }
 function renderLib(d){
-  $('#libSub').textContent=d.repo?`Sumber: github.com/${d.repo}`:'Sumber GitHub belum ditetapkan';
+  $('#libSub').textContent=d.repo?`Upload terus, atau dari github.com/${d.repo}`:'Upload game, kemudian kongsi pautan ini dengan kawan';
   $('#libErr').textContent=d.error||'';
+  $('#adminRow').style.display=d.locked?'block':'none';
   const ids=new Set(d.games.map(g=>g.id));
   for(const id of Object.keys(rows)) if(!ids.has(id)){rows[id].el.remove();delete rows[id]}
   d.games.forEach(updRow);
   $('#libEmpty').textContent=d.games.length?'':(d.repo
-    ?'Tiada fail .zip dijumpai. Upload zip game ke folder games/ dalam repo (atau sebagai Release asset), kemudian tekan "Muat semula senarai".'
-    :'Tetapkan pembolehubah persekitaran GITHUB_REPO (cth. namaanda/vn-games) pada Render, kemudian muat semula halaman.');
+    ?'Belum ada game. Upload fail .zip atau .7z di atas.'
+    :'Belum ada game. Upload fail .zip atau .7z di atas.');
   if(wantPlay){
     const g=d.games.find(x=>x.id===wantPlay);
     if(g&&g.state==='ready'){const id=wantPlay;wantPlay=null;playGame(id)}
@@ -729,18 +857,50 @@ async function onMain(id,state){
   pollLib(false);
 }
 async function onDelete(id,name){
-  if(!confirm(`Padam cache "${name}"? Anda perlu memuat turunnya semula untuk bermain.`))return;
-  const r=await fetch(`/api/games/${id}/cache`,{method:'DELETE'});
+  if(!confirm(`Padam "${name}" daripada server? Upload atau muat turun semula diperlukan untuk bermain.`))return;
+  const r=await fetch(`/api/games/${id}/cache`,{method:'DELETE',headers:adminH()});
   if(!r.ok)toast((await r.json()).error||'Gagal');else{toast('Cache dipadam');if(GID===id){started=false;GID=null;bgm.pause()}}
   pollLib(false);
 }
 $('#bClearAll').onclick=async()=>{
   if(!confirm('Padam semua game dalam cache?'))return;
-  const r=await fetch('/api/cache',{method:'DELETE'});
+  const r=await fetch('/api/cache',{method:'DELETE',headers:adminH()});
   if(!r.ok)toast((await r.json()).error||'Gagal');else{toast('Semua cache dipadam');started=false;GID=null;bgm.pause();$('#bBack').style.display='none'}
   pollLib(false);
 };
 $('#bRefresh').onclick=()=>pollLib(true);
+
+// ---- upload ----
+$('#adminPw').value=sessionStorage.getItem('vn:admin')||'';
+$('#adminPw').oninput=e=>sessionStorage.setItem('vn:admin',e.target.value);
+function adminH(){const v=$('#adminPw').value;return v?{'X-Admin-Password':v}:{}}
+function upMsg(t,err){const m=$('#upMsg');m.textContent=t;m.className=err?'err':''}
+let uploading=false;
+function upload(file){
+  if(uploading)return;
+  if(!/\.(zip|7z)$/i.test(file.name)){upMsg('Hanya fail .zip atau .7z diterima.',true);return}
+  uploading=true;upMsg('');
+  const xhr=new XMLHttpRequest(),fd=new FormData(),bar=$('#upProg i');
+  fd.append('file',file);xhr.open('POST','/api/upload');
+  const h=adminH();for(const k in h)xhr.setRequestHeader(k,h[k]);
+  $('#upProg').style.display='block';bar.style.width='0';
+  xhr.upload.onprogress=e=>{if(e.lengthComputable){bar.style.width=Math.round(e.loaded*100/e.total)+'%';upMsg(`Mengupload ${fmt(e.loaded)} / ${fmt(e.total)}`)}};
+  xhr.onload=()=>{
+    uploading=false;$('#upProg').style.display='none';
+    let d={};try{d=JSON.parse(xhr.responseText)}catch(e){}
+    if(xhr.status>=200&&xhr.status<300){upMsg('Upload siap, mengekstrak...');wantPlay=d.id;pollLib(false)}
+    else upMsg(d.error||`Upload gagal (${xhr.status}).`,true);
+  };
+  xhr.onerror=()=>{uploading=false;$('#upProg').style.display='none';upMsg('Sambungan terputus semasa upload.',true)};
+  xhr.send(fd);
+}
+$('#bUp').onclick=()=>$('#fileIn').click();
+$('#fileIn').onchange=e=>{if(e.target.files[0])upload(e.target.files[0]);e.target.value=''};
+const dz=$('#drop');
+['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('over')}));
+['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('over')}));
+dz.addEventListener('drop',e=>{if(e.dataTransfer.files[0])upload(e.dataTransfer.files[0])});
+window.addEventListener('dragover',e=>e.preventDefault());window.addEventListener('drop',e=>e.preventDefault());
 $('#bBack').onclick=()=>{$('#lib').style.display='none';clearTimeout(libTimer)};
 $('#bLib').onclick=openLib;$('#bEndLib').onclick=()=>{$('#ovEnd').style.display='none';openLib()};
 
