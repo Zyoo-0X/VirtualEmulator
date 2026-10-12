@@ -4,8 +4,12 @@ Enjin Visual Novel (gaya Artemis) - versi GitHub + Render
 Enjin asal, ditulis dari awal. BUKAN pelaksanaan format Artemis sebenar.
 
 Cara kerja:
-  A. UPLOAD TERUS: seret / pilih fail .zip atau .7z di laman web. Server ekstrak dan game
-     terus dimainkan; kawan anda buka pautan yang sama dan boleh main game itu juga.
+  A. UPLOAD TERUS: seret / pilih fail .zip atau .7z di laman web (sehingga beberapa GB; fail
+     dihantar berpotong-potong 16 MB). Server ekstrak dan game terus dimainkan; kawan anda
+     buka pautan yang sama dan boleh main game itu juga.
+     Jika GITHUB_REPO + GITHUB_TOKEN ditetapkan, arkib turut disimpan ke GitHub Release
+     (dipecah automatik kepada bahagian <2 GB kerana had 2 GB/fail GitHub) supaya game kekal
+     walaupun server restart. Selepas itu ia dimuat turun semula daripada GitHub bila perlu.
   B. GITHUB (pilihan): upload .zip/.7z ke GitHub (folder `games/` atau Release asset);
      senarai dikesan automatik, tekan "Muat turun & main".
   Butang "Padam cache" membuang game daripada server.
@@ -15,12 +19,14 @@ Pembolehubah persekitaran (Render -> Environment):
   GITHUB_GAMES_PATH   folder zip dalam repo (lalai: "games"); kosongkan untuk matikan
   GITHUB_BRANCH       cabang (lalai: cabang asal repo)
   GITHUB_USE_RELEASES "1" (lalai) untuk turut baca Release assets
-  GITHUB_TOKEN        pilihan: untuk repo persendirian / elak had kadar API
+  GITHUB_TOKEN        token (Contents: Read and write) - wajib untuk upload ke GitHub; juga
+                      untuk repo persendirian / elak had kadar API
+  GITHUB_RELEASE_TAG  tag Release penyimpanan game (lalai: "vn-games")
   ADMIN_PASSWORD      pilihan: jika ditetapkan, upload & padam memerlukan kata laluan ini
                       (bermain tetap bebas untuk semua orang)
   CACHE_DIR           lokasi cache (lalai: ./cache)
-  MAX_DOWNLOAD_MB     had saiz arkib upload/muat turun (lalai 1500)
-  MAX_UNZIPPED_MB     had saiz selepas ekstrak (lalai 3000)
+  MAX_DOWNLOAD_MB     had saiz arkib upload/muat turun (lalai 6144 = 6 GB)
+  MAX_UNZIPPED_MB     had saiz selepas ekstrak (lalai 12288 = 12 GB)
 
 Dalam arkib (.zip atau .7z), folder game mesti mengandungi skrip .vn (terus, atau dalam scripts/) dan
 aset (terus, atau dalam assets/). Zip boleh ada satu folder induk. Lihat format skrip di bawah.
@@ -47,6 +53,7 @@ Pada Render:        gunicorn app:app --workers 1 --threads 8 --timeout 300
 import os
 import re
 import hmac
+import secrets
 import json
 import shutil
 import threading
@@ -71,11 +78,18 @@ GH_BRANCH = os.environ.get("GITHUB_BRANCH", "").strip()
 GH_RELEASES = os.environ.get("GITHUB_USE_RELEASES", "1") != "0"
 GH_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 ADMIN = os.environ.get("ADMIN_PASSWORD", "")
-MAX_DL = int(os.environ.get("MAX_DOWNLOAD_MB", "1500")) * 1024 * 1024
-MAX_UNZIP = int(os.environ.get("MAX_UNZIPPED_MB", "3000")) * 1024 * 1024
+MAX_DL = int(os.environ.get("MAX_DOWNLOAD_MB", "6144")) * 1024 * 1024
+MAX_UNZIP = int(os.environ.get("MAX_UNZIPPED_MB", "12288")) * 1024 * 1024
+GH_TAG = os.environ.get("GITHUB_RELEASE_TAG", "vn-games").strip() or "vn-games"
+GH_WRITE = bool(GH_REPO and GH_TOKEN)   # boleh upload ke GitHub?
+PART = 1900 * 1024 * 1024               # < 2 GiB, had satu aset Release
+CHUNK = 16 * 1024 * 1024                # saiz potongan upload dari pelayar
+PENDING = CACHE / ".pending"
 LIST_TTL = 45  # saat; elak melebihi had kadar API GitHub
 
 CACHE.mkdir(parents=True, exist_ok=True)
+shutil.rmtree(CACHE / ".pending", ignore_errors=True)
+(CACHE / ".pending").mkdir(exist_ok=True)
 for _t in CACHE.glob(".*.tmp"):
     shutil.rmtree(_t, ignore_errors=True)
 
@@ -212,25 +226,39 @@ def gh_get(url, params=None):
 def fetch_sources():
     items, errors = {}, []
 
-    def add(name, size, source, **kw):
+    def add(name, size, source, parts=None, **kw):
         if not re.search(r"\.(zip|7z)$", name, re.I):
             return
         gid = slug(name)
         if gid not in items:
             items[gid] = {"id": gid, "name": re.sub(r"\.(zip|7z)$", "", name, flags=re.I),
-                          "size": size, "source": source, **kw}
+                          "size": size, "source": source, "parts": parts or [], **kw}
+
+    def asset_part(a):
+        return {"url": a["url"] if GH_TOKEN else a["browser_download_url"],
+                "accept": "application/octet-stream" if GH_TOKEN else "*/*",
+                "size": a["size"], "asset_id": a["id"]}
 
     if GH_REPO:
         if GH_RELEASES:
             try:
-                for rel in gh_get(f"https://api.github.com/repos/{GH_REPO}/releases",
-                                  {"per_page": 20}) or []:
-                    for a in rel.get("assets", []):
-                        if GH_TOKEN:
-                            add(a["name"], a["size"], "release", url=a["url"],
-                                accept="application/octet-stream")
+                for rel in gh_get(f"https://api.github.com/repos/{GH_REPO}/releases", {"per_page": 20}) or []:
+                    assets = rel.get("assets", [])
+                    if len(assets) >= 30:
+                        assets = gh_get(f"https://api.github.com/repos/{GH_REPO}/releases/{rel['id']}/assets",
+                                        {"per_page": 100}) or assets
+                    groups = {}
+                    for a in assets:
+                        m = re.match(r"^(.+\.(?:zip|7z))\.(\d{3})$", a["name"], re.I)
+                        if m:  # bahagian berpecah: nama.zip.001, .002, ...
+                            groups.setdefault(m.group(1), {})[int(m.group(2))] = a
                         else:
-                            add(a["name"], a["size"], "release", url=a["browser_download_url"], accept="*/*")
+                            add(a["name"], a["size"], "release", parts=[asset_part(a)])
+                    for base, d in groups.items():
+                        idx = sorted(d)
+                        if idx == list(range(1, len(idx) + 1)):  # hanya jika lengkap
+                            add(base, sum(d[i]["size"] for i in idx), "release",
+                                parts=[asset_part(d[i]) for i in idx])
             except Exception as e:
                 errors.append(f"Release: {e}")
         if GH_PATH:
@@ -240,10 +268,12 @@ def fetch_sources():
                 for f in data or []:
                     if f.get("type") == "file":
                         if GH_TOKEN:
-                            add(f["name"], f["size"], "github", url=f["url"],
-                                accept="application/vnd.github.raw")
+                            part = {"url": f["url"], "accept": "application/vnd.github.raw", "size": f["size"]}
                         elif f.get("download_url"):
-                            add(f["name"], f["size"], "github", url=f["download_url"], accept="*/*")
+                            part = {"url": f["download_url"], "accept": "*/*", "size": f["size"]}
+                        else:
+                            continue
+                        add(f["name"], f["size"], "github", parts=[part])
             except Exception as e:
                 errors.append(f"Repo: {e}")
     if LOCAL_ZIPS.is_dir():
@@ -334,13 +364,14 @@ def safe_extract(apath, out):
     raise ValueError("Fail bukan arkib .zip atau .7z yang sah.")
 
 
-def finalize(gid, job, tmp, apath, name, source):
+def finalize(gid, job, tmp, apath, name, source, delete_archive=True):
     """Ekstrak arkib dalam tmp, cari root game, dan letak ke cache."""
     if not sniff(apath):
         raise ValueError("Fail bukan arkib .zip atau .7z yang sah.")
     job["state"] = "extracting"
     size = safe_extract(apath, tmp / "files")
-    Path(apath).unlink()
+    if delete_archive:
+        Path(apath).unlink()
     root = find_root(tmp / "files")
     if root is None:
         raise ValueError("Tiada fail .vn dijumpai dalam arkib (letak skrip dalam scripts/ atau terus di root).")
@@ -366,6 +397,13 @@ def run_extract(gid, tmp, apath, name, source):
         fail(JOBS[gid], tmp, e)
 
 
+def disk_ok(size):
+    free = shutil.disk_usage(CACHE).free
+    if free < size * 2 + (200 << 20):
+        raise ValueError(f"Ruang disk server tidak cukup (bebas {free >> 20} MB, perlu kira-kira "
+                         f"{(size * 2 + (200 << 20)) >> 20} MB termasuk hasil ekstrak).")
+
+
 def run_download(gid, item):
     job = JOBS[gid]
     tmp = CACHE / f".{gid}.tmp"
@@ -376,24 +414,29 @@ def run_download(gid, item):
         if item["source"] == "local":
             src = Path(item["path"])
             job["total"] = src.stat().st_size
+            disk_ok(job["total"])
             with open(src, "rb") as fi, open(apath, "wb") as fo:
                 while chunk := fi.read(1 << 20):
                     fo.write(chunk)
                     job["done"] += len(chunk)
         else:
-            with requests.get(item["url"], stream=True, timeout=30, allow_redirects=True,
-                              headers={"User-Agent": "vn-engine", "Accept": item.get("accept", "*/*"),
-                                       **({"Authorization": f"Bearer {GH_TOKEN}"} if GH_TOKEN else {})}) as r:
-                r.raise_for_status()
-                job["total"] = int(r.headers.get("Content-Length") or item.get("size") or 0)
-                if job["total"] > MAX_DL:
-                    raise ValueError("Saiz arkib melebihi had muat turun.")
-                with open(apath, "wb") as fo:
-                    for chunk in r.iter_content(1 << 18):
-                        fo.write(chunk)
-                        job["done"] += len(chunk)
-                        if job["done"] > MAX_DL:
-                            raise ValueError("Saiz arkib melebihi had muat turun.")
+            parts = item["parts"]
+            job["total"] = sum(p.get("size") or 0 for p in parts)
+            if job["total"] > MAX_DL:
+                raise ValueError("Saiz arkib melebihi had muat turun.")
+            disk_ok(job["total"])
+            with open(apath, "wb") as fo:
+                for pt in parts:  # bahagian .001, .002 ... disambung berturutan
+                    hdr = {"User-Agent": "vn-engine", "Accept": pt.get("accept", "*/*")}
+                    if GH_TOKEN and pt["url"].startswith("https://api.github.com/"):
+                        hdr["Authorization"] = f"Bearer {GH_TOKEN}"
+                    with requests.get(pt["url"], stream=True, timeout=30, allow_redirects=True, headers=hdr) as r:
+                        r.raise_for_status()
+                        for chunk in r.iter_content(1 << 20):
+                            fo.write(chunk)
+                            job["done"] += len(chunk)
+                            if job["done"] > MAX_DL:
+                                raise ValueError("Saiz arkib melebihi had muat turun.")
         finalize(gid, job, tmp, apath, item["name"], item["source"])
     except Exception as e:
         fail(job, tmp, e)
@@ -419,12 +462,15 @@ def start_download(gid):
 
 def busy(gid):
     j = JOBS.get(gid)
-    return bool(j and j["state"] in ("downloading", "extracting"))
+    if not j:
+        return False
+    gh = j.get("gh") or {}
+    return j["state"] in ("downloading", "extracting") or gh.get("state") in ("waiting", "uploading")
 
 
 # ------------------------------------------------------------------- aplikasi
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = MAX_DL + (1 << 20)
+app.config["MAX_CONTENT_LENGTH"] = CHUNK + (1 << 20)  # satu potongan upload
 
 
 def deny():
@@ -439,40 +485,249 @@ def deny():
 
 @app.errorhandler(413)
 def too_large(_):
-    return jsonify(error=f"Fail terlalu besar (had {MAX_DL // 1048576} MB)."), 413
+    return jsonify(error="Potongan terlalu besar."), 413
 
 
-@app.post("/api/upload")
-def api_upload():
-    d = deny()
-    if d:
-        return d
-    f = request.files.get("file")
-    if not f or not f.filename:
-        return jsonify(error="Tiada fail dihantar."), 400
-    fname = Path(f.filename.replace("\\", "/")).name
-    if not re.search(r"\.(zip|7z)$", fname, re.I):
-        return jsonify(error="Hanya fail .zip atau .7z diterima."), 400
-    stem = re.sub(r"\.(zip|7z)$", "", fname, flags=re.I)
-    base, n = slug(fname), 1
-    with JOBS_LOCK:
-        gid = base
-        while busy(gid) or (CACHE / gid).exists() or (gid in JOBS and JOBS[gid]["state"] == "error"):
-            n += 1
-            gid = f"{base}-{n}"
-        name = stem if n == 1 else f"{stem} ({n})"
-        JOBS[gid] = {"state": "extracting", "done": 0, "total": 0, "error": "", "name": name, "source": "upload"}
+class FilePart:
+    """Bahagian fail (offset, panjang) untuk dihantar ke GitHub tanpa memuatkan ke RAM."""
+
+    def __init__(self, path, off, length, cb):
+        self.f = open(path, "rb")
+        self.f.seek(off)
+        self.length = self.left = length
+        self.cb = cb
+
+    def __len__(self):
+        return self.length
+
+    def read(self, n=-1):
+        if self.left <= 0:
+            return b""
+        n = self.left if (n is None or n < 0) else min(n, self.left)
+        b = self.f.read(min(n, 1 << 20))
+        self.left -= len(b)
+        self.cb(len(b))
+        return b
+
+    def __iter__(self):
+        while b := self.read(1 << 20):
+            yield b
+
+    def close(self):
+        self.f.close()
+
+
+def gh_release_id():
+    r = requests.get(f"https://api.github.com/repos/{GH_REPO}/releases/tags/{GH_TAG}",
+                     headers=gh_headers(), timeout=20)
+    if r.status_code == 200:
+        return r.json()["id"]
+    if r.status_code != 404:
+        r.raise_for_status()
+    r = requests.post(f"https://api.github.com/repos/{GH_REPO}/releases", headers=gh_headers(), timeout=20,
+                      json={"tag_name": GH_TAG, "name": "Game library", "draft": False, "prerelease": False,
+                            "body": "Disimpan oleh Enjin VN. Padam game melalui laman web."})
+    r.raise_for_status()
+    return r.json()["id"]
+
+
+def gh_assets(rid):
+    out, page = [], 1
+    while True:
+        r = requests.get(f"https://api.github.com/repos/{GH_REPO}/releases/{rid}/assets",
+                         headers=gh_headers(), params={"per_page": 100, "page": page}, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        out += data
+        if len(data) < 100:
+            return out
+        page += 1
+
+
+def publish_github(gid, apath, ext, gh):
+    """Upload arkib ke GitHub Release; pecah kepada bahagian <2 GB jika perlu."""
+    size = os.path.getsize(apath)
+    n = max(1, -(-size // PART))
+    rid = gh_release_id()
+    finals = [f"{gid}.{ext}"] if n == 1 else [f"{gid}.{ext}.{i + 1:03d}" for i in range(n)]
+    uploaded, base_done = [], 0
+    gh["state"] = "uploading"
+    for i, fname in enumerate(finals):
+        off, ln, tmpname = i * PART, min(PART, size - i * PART), fname + ".tmp"
+        for attempt in range(3):
+            try:
+                for a in gh_assets(rid):  # buang sisa percubaan terdahulu
+                    if a["name"] in (tmpname, fname):
+                        requests.delete(a["url"], headers=gh_headers(), timeout=30)
+                gh["done"] = base_done
+                fp = FilePart(apath, off, ln, lambda k: gh.__setitem__("done", gh["done"] + k))
+                try:
+                    r = requests.post(f"https://uploads.github.com/repos/{GH_REPO}/releases/{rid}/assets",
+                                      params={"name": tmpname}, data=fp, timeout=(30, 7200),
+                                      headers={**gh_headers(), "Content-Type": "application/octet-stream"})
+                finally:
+                    fp.close()
+                r.raise_for_status()
+                uploaded.append((r.json()["id"], fname))
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(3 * (attempt + 1))
+        base_done += ln
+    # namakan semula selepas semua bahagian siap, supaya game separuh jalan tidak muncul dalam senarai
+    for aid, fname in uploaded:
+        r = requests.patch(f"https://api.github.com/repos/{GH_REPO}/releases/assets/{aid}",
+                           headers=gh_headers(), json={"name": fname}, timeout=30)
+        r.raise_for_status()
+
+
+def run_upload_job(gid, apath, name, ext):
+    job = JOBS[gid]
     tmp = CACHE / f".{gid}.tmp"
     try:
         shutil.rmtree(tmp, ignore_errors=True)
         tmp.mkdir(parents=True)
-        apath = tmp / "game.bin"
-        f.save(apath)
+        finalize(gid, job, tmp, apath, name, "upload", delete_archive=False)
     except Exception as e:
-        fail(JOBS[gid], tmp, e)
-        return jsonify(error="Gagal menyimpan fail."), 500
-    threading.Thread(target=run_extract, args=(gid, tmp, apath, name, "upload"), daemon=True).start()
+        fail(job, tmp, e)
+        job.pop("gh", None)
+        Path(apath).unlink(missing_ok=True)
+        return
+    if GH_WRITE:
+        gh = job["gh"]
+        try:
+            publish_github(gid, apath, ext, gh)
+            gh["state"] = "done"
+            remote(force=True)
+        except Exception as e:
+            gh["state"] = "error"
+            gh["error"] = str(e)[:200]
+    Path(apath).unlink(missing_ok=True)
+
+
+UPLOADS = {}  # uid -> {name, size, received, path, last}
+
+
+@app.post("/api/upload/init")
+def upload_init():
+    d = deny()
+    if d:
+        return d
+    data = request.get_json(force=True, silent=True) or {}
+    name = Path(str(data.get("name", "")).replace("\\", "/")).name
+    try:
+        size = int(data.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if not re.search(r"\.(zip|7z)$", name, re.I):
+        return jsonify(error="Hanya fail .zip atau .7z diterima."), 400
+    if size <= 0:
+        return jsonify(error="Fail kosong."), 400
+    if size > MAX_DL:
+        return jsonify(error=f"Fail terlalu besar (had {MAX_DL >> 20} MB)."), 413
+    free = shutil.disk_usage(CACHE).free
+    need = size * 2 + (200 << 20)
+    if free < need:
+        return jsonify(error=f"Ruang disk server tidak cukup: bebas {free >> 20} MB, perlu kira-kira "
+                             f"{need >> 20} MB (arkib + hasil ekstrak)."), 507
+    now = time.time()
+    for k in [k for k, u in UPLOADS.items() if now - u["last"] > 6 * 3600]:  # buang sesi lapuk
+        Path(UPLOADS.pop(k)["path"]).unlink(missing_ok=True)
+    uid = secrets.token_hex(8)
+    path = PENDING / f"{uid}.bin"
+    PENDING.mkdir(exist_ok=True)
+    path.write_bytes(b"")
+    UPLOADS[uid] = {"name": name, "size": size, "received": 0, "path": str(path), "last": now}
+    return jsonify(uid=uid, chunk=CHUNK, github=GH_WRITE)
+
+
+@app.post("/api/upload/<uid>/chunk")
+def upload_chunk(uid):
+    d = deny()
+    if d:
+        return d
+    u = UPLOADS.get(uid)
+    if not u:
+        return jsonify(error="Sesi upload tidak dijumpai."), 404
+    off = request.args.get("offset", type=int)
+    if off != u["received"]:  # klien perlu menyambung dari kedudukan sebenar
+        return jsonify(error="Offset tidak sepadan.", received=u["received"]), 409
+    n = 0
+    try:
+        with open(u["path"], "r+b") as f:
+            f.seek(off)
+            while b := request.stream.read(1 << 20):
+                n += len(b)
+                if off + n > u["size"]:
+                    raise ValueError("Data melebihi saiz yang diisytiharkan.")
+                f.write(b)
+    except Exception as e:
+        with open(u["path"], "r+b") as f:
+            f.truncate(u["received"])
+        return jsonify(error=str(e) or "Potongan gagal diterima."), 400
+    if n == 0:
+        return jsonify(error="Potongan kosong."), 400
+    u["received"] += n
+    u["last"] = time.time()
+    return jsonify(received=u["received"])
+
+
+@app.post("/api/upload/<uid>/finish")
+def upload_finish(uid):
+    d = deny()
+    if d:
+        return d
+    u = UPLOADS.get(uid)
+    if not u:
+        return jsonify(error="Sesi upload tidak dijumpai."), 404
+    if u["received"] != u["size"]:
+        return jsonify(error="Upload belum lengkap.", received=u["received"]), 400
+    kind = sniff(u["path"])
+    if not kind:
+        UPLOADS.pop(uid, None)
+        Path(u["path"]).unlink(missing_ok=True)
+        return jsonify(error="Fail bukan arkib .zip atau .7z yang sah."), 400
+    stem = re.sub(r"\.(zip|7z)$", "", u["name"], flags=re.I)
+    base, n = slug(u["name"]), 1
+    taken = set(remote()[0])
+    with JOBS_LOCK:
+        gid = base
+        while gid in taken or busy(gid) or (CACHE / gid).exists() or (gid in JOBS and JOBS[gid]["state"] == "error"):
+            n += 1
+            gid = f"{base}-{n}"
+        name = stem if n == 1 else f"{stem} ({n})"
+        JOBS[gid] = {"state": "extracting", "done": 0, "total": 0, "error": "", "name": name, "source": "upload"}
+        if GH_WRITE:
+            JOBS[gid]["gh"] = {"state": "waiting", "done": 0, "total": u["size"], "error": ""}
+    UPLOADS.pop(uid, None)
+    threading.Thread(target=run_upload_job, args=(gid, u["path"], name, kind), daemon=True).start()
     return jsonify(id=gid, name=name)
+
+
+@app.delete("/api/games/<gid>/github")
+def api_delete_github(gid):
+    d = deny()
+    if d:
+        return d
+    if not SAFE.match(gid):
+        abort(400)
+    if not GH_WRITE:
+        return jsonify(error="Token GitHub tidak ditetapkan pada server."), 400
+    if busy(gid):
+        return jsonify(error="Sedang memuat turun / mengupload."), 409
+    it = remote(force=True)[0].get(gid)
+    if not it or it["source"] != "release":
+        return jsonify(error="Game ini bukan daripada GitHub Release."), 404
+    for pt in it["parts"]:
+        r = requests.delete(f"https://api.github.com/repos/{GH_REPO}/releases/assets/{pt['asset_id']}",
+                            headers=gh_headers(), timeout=30)
+        if r.status_code not in (204, 404):
+            return jsonify(error=f"GitHub menolak padam ({r.status_code})."), 502
+    shutil.rmtree(CACHE / gid, ignore_errors=True)
+    JOBS.pop(gid, None)
+    remote(force=True)
+    return jsonify(ok=True)
 
 
 @app.get("/api/games")
@@ -501,8 +756,9 @@ def api_games():
         else:
             g.update(state="none", done=0, total=0, error="")
         g["cached_size"] = m["size"] if m else 0
+        g["gh"] = (j or {}).get("gh")
         out.append(g)
-    return jsonify(games=out, error=err, repo=GH_REPO, locked=bool(ADMIN))
+    return jsonify(games=out, error=err, repo=GH_REPO, locked=bool(ADMIN), github_write=GH_WRITE)
 
 
 @app.post("/api/games/<gid>/download")
@@ -663,7 +919,7 @@ button:focus-visible,.opt:focus-visible{outline:2px solid var(--edge);outline-of
     <h1>Enjin VN</h1><div id="libSub"></div><div id="libErr"></div>
     <div id="drop"><b>Upload game</b>: seret fail <b>.zip</b> atau <b>.7z</b> ke sini, atau
       <button id="bUp">pilih fail</button><input type="file" id="fileIn" accept=".zip,.7z" hidden>
-      <small>Arkib mesti mengandungi folder game dengan skrip .vn. Semua pengunjung boleh main game yang diupload.</small>
+      <small id="dropNote">Arkib mesti mengandungi folder game dengan skrip .vn. Fail besar (GB) dihantar berpotong-potong, jangan tutup tab semasa upload.</small>
       <div class="prog" id="upProg"><i></i></div><div id="upMsg"></div></div>
     <div id="adminRow"><input type="password" id="adminPw" placeholder="Kata laluan admin (untuk upload / padam)" autocomplete="off"></div>
     <div id="libList"></div><div id="libEmpty"></div>
@@ -798,10 +1054,11 @@ const libOpen=()=>$('#lib').style.display==='block';
 
 function makeRow(g){
   const el=document.createElement('div');el.className='game';
-  el.innerHTML='<div><div class="gn"></div><div class="gm"></div></div><div class="acts"><button class="main"></button><button class="del">Padam cache</button></div><div class="prog"><i></i></div>';
-  const r={el,gn:el.querySelector('.gn'),gm:el.querySelector('.gm'),main:el.querySelector('.main'),del:el.querySelector('.del'),prog:el.querySelector('.prog'),bar:el.querySelector('.prog i'),id:g.id,state:'none'};
+  el.innerHTML='<div><div class="gn"></div><div class="gm"></div></div><div class="acts"><button class="main"></button><button class="del">Padam cache</button><button class="delgh del">Padam dari GitHub</button></div><div class="prog"><i></i></div>';
+  const r={el,gn:el.querySelector('.gn'),gm:el.querySelector('.gm'),main:el.querySelector('.main'),del:el.querySelector('.del'),delgh:el.querySelector('.delgh'),prog:el.querySelector('.prog'),bar:el.querySelector('.prog i'),id:g.id,state:'none'};
   r.main.onclick=()=>onMain(r.id,r.state);
   r.del.onclick=()=>onDelete(r.id,r.gn.textContent);
+  r.delgh.onclick=()=>onDeleteGh(r.id,r.gn.textContent);
   $('#libList').appendChild(el);rows[g.id]=r;return r;
 }
 function updRow(g){
@@ -815,21 +1072,33 @@ function updRow(g){
   else if(g.state==='error'){m='Ralat: '+g.error;r.gm.className='gm err'}
   else{m=(g.size?fmt(g.size)+', ':'')+src+', belum dimuat turun'}
   if(g.state==='extracting'&&!g.total)m='Mengekstrak fail...';
+  const gh=g.gh,ghActive=!!gh&&(gh.state==='waiting'||gh.state==='uploading');
+  if(gh){
+    if(gh.state==='uploading'){const q=gh.total?Math.min(100,Math.round(gh.done*100/gh.total)):0;m+=` | Menyimpan ke GitHub ${fmt(gh.done)} / ${fmt(gh.total)} (${q}%)`}
+    else if(gh.state==='waiting')m+=' | Menunggu giliran simpan ke GitHub';
+    else if(gh.state==='done')m+=' | Disimpan di GitHub';
+    else if(gh.state==='error'){m+=' | GitHub gagal: '+gh.error;}
+  }
   r.gm.textContent=m;
-  const active=g.state==='downloading'||g.state==='extracting';
+  const active=g.state==='downloading'||g.state==='extracting'||ghActive;
   r.prog.style.display=active?'block':'none';
-  r.bar.style.width=(g.state==='extracting'?100:pct)+'%';
+  r.bar.style.width=(ghActive&&gh.total?Math.min(100,Math.round(gh.done*100/gh.total)):g.state==='extracting'?100:pct)+'%';
   r.main.textContent=({none:'Muat turun & main',downloading:'Memuat turun...',extracting:'Mengekstrak...',ready:'Main',error:'Cuba lagi'})[g.state];
-  r.main.disabled=active;
+  r.main.disabled=g.state==='downloading'||g.state==='extracting';
   r.main.style.display=(g.state==='error'&&g.source==='upload')?'none':'';
   r.del.textContent=g.state==='error'?'Buang':'Padam cache';
   r.del.style.display=(g.state==='ready'||g.state==='error')?'':'none';
   r.del.disabled=active;
+  r.delgh.style.display=(g.source==='release'&&LIB.github_write&&g.state!=='downloading'&&g.state!=='extracting')?'':'none';
+  r.delgh.disabled=active;
 }
+let LIB={};
 function renderLib(d){
+  LIB=d;
   $('#libSub').textContent=d.repo?`Upload terus, atau dari github.com/${d.repo}`:'Upload game, kemudian kongsi pautan ini dengan kawan';
   $('#libErr').textContent=d.error||'';
   $('#adminRow').style.display=d.locked?'block':'none';
+  $('#dropNote').textContent='Arkib mesti mengandungi folder game dengan skrip .vn. Fail besar (GB) dihantar berpotong-potong, jangan tutup tab semasa upload. '+(d.github_write?'Game turut disimpan ke GitHub (dipecah automatik jika >2 GB) supaya kekal.':'GitHub belum ditetapkan: game hanya disimpan sementara pada server.');
   const ids=new Set(d.games.map(g=>g.id));
   for(const id of Object.keys(rows)) if(!ids.has(id)){rows[id].el.remove();delete rows[id]}
   d.games.forEach(updRow);
@@ -847,7 +1116,7 @@ async function pollLib(force){
   let d=null;
   try{d=await (await fetch('/api/games'+(force?'?refresh=1':''))).json();renderLib(d)}catch(e){$('#libErr').textContent='Tidak dapat hubungi server.'}
   if(libOpen()){
-    const active=d&&d.games.some(g=>g.state==='downloading'||g.state==='extracting');
+    const active=d&&d.games.some(g=>g.state==='downloading'||g.state==='extracting'||(g.gh&&(g.gh.state==='uploading'||g.gh.state==='waiting')));
     libTimer=setTimeout(()=>pollLib(false),active?600:30000);
   }
 }
@@ -868,6 +1137,12 @@ async function onDelete(id,name){
   if(!r.ok)toast((await r.json()).error||'Gagal');else{toast('Cache dipadam');if(GID===id){started=false;GID=null;bgm.pause()}}
   pollLib(false);
 }
+async function onDeleteGh(id,name){
+  if(!confirm(`Padam "${name}" dari GitHub dan server? Ini kekal dan tidak boleh dibatalkan.`))return;
+  const r=await fetch(`/api/games/${id}/github`,{method:'DELETE',headers:adminH()});
+  if(!r.ok)toast((await r.json()).error||'Gagal');else{toast('Dipadam dari GitHub');if(GID===id){started=false;GID=null;bgm.pause()}}
+  pollLib(true);
+}
 $('#bClearAll').onclick=async()=>{
   if(!confirm('Padam semua game dalam cache?'))return;
   const r=await fetch('/api/cache',{method:'DELETE',headers:adminH()});
@@ -882,23 +1157,47 @@ $('#adminPw').oninput=e=>sessionStorage.setItem('vn:admin',e.target.value);
 function adminH(){const v=$('#adminPw').value;return v?{'X-Admin-Password':v}:{}}
 function upMsg(t,err){const m=$('#upMsg');m.textContent=t;m.className=err?'err':''}
 let uploading=false;
-function upload(file){
+function sendChunk(uid,off,blob,onProg){
+  return new Promise(res=>{
+    const x=new XMLHttpRequest();x.open('POST',`/api/upload/${uid}/chunk?offset=${off}`);
+    const h=adminH();for(const k in h)x.setRequestHeader(k,h[k]);
+    x.upload.onprogress=e=>onProg(e.loaded);
+    x.onload=()=>{let d={};try{d=JSON.parse(x.responseText)}catch(e){}res({status:x.status,d})};
+    x.onerror=()=>res({status:0,d:{}});x.ontimeout=x.onerror;
+    x.send(blob);
+  });
+}
+async function jpost(url,body){
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',...adminH()},body:body?JSON.stringify(body):undefined});
+  let d={};try{d=await r.json()}catch(e){}return{ok:r.ok,d};
+}
+async function upload(file){
   if(uploading)return;
   if(!/\.(zip|7z)$/i.test(file.name)){upMsg('Hanya fail .zip atau .7z diterima.',true);return}
-  uploading=true;upMsg('');
-  const xhr=new XMLHttpRequest(),fd=new FormData(),bar=$('#upProg i');
-  fd.append('file',file);xhr.open('POST','/api/upload');
-  const h=adminH();for(const k in h)xhr.setRequestHeader(k,h[k]);
-  $('#upProg').style.display='block';bar.style.width='0';
-  xhr.upload.onprogress=e=>{if(e.lengthComputable){bar.style.width=Math.round(e.loaded*100/e.total)+'%';upMsg(`Mengupload ${fmt(e.loaded)} / ${fmt(e.total)}`)}};
-  xhr.onload=()=>{
-    uploading=false;$('#upProg').style.display='none';
-    let d={};try{d=JSON.parse(xhr.responseText)}catch(e){}
-    if(xhr.status>=200&&xhr.status<300){upMsg('Upload siap, mengekstrak...');wantPlay=d.id;pollLib(false)}
-    else upMsg(d.error||`Upload gagal (${xhr.status}).`,true);
-  };
-  xhr.onerror=()=>{uploading=false;$('#upProg').style.display='none';upMsg('Sambungan terputus semasa upload.',true)};
-  xhr.send(fd);
+  uploading=true;upMsg('Menyediakan upload...');
+  const bar=$('#upProg i');$('#upProg').style.display='block';bar.style.width='0';
+  const stop=e=>{e.preventDefault();e.returnValue=''};window.addEventListener('beforeunload',stop);
+  const fail=m=>{upMsg(m,true);$('#upProg').style.display='none'};
+  try{
+    const ini=await jpost('/api/upload/init',{name:file.name,size:file.size});
+    if(!ini.ok){fail(ini.d.error||'Gagal memulakan upload.');return}
+    const uid=ini.d.uid,CH=ini.d.chunk;let off=0,tries=0;
+    while(off<file.size){
+      const end=Math.min(off+CH,file.size),t0=Date.now();
+      const r=await sendChunk(uid,off,file.slice(off,end),l=>{
+        const p=off+l;bar.style.width=Math.round(p*100/file.size)+'%';
+        upMsg(`Mengupload ${fmt(p)} / ${fmt(file.size)} (${Math.round(p*100/file.size)}%)`)});
+      if(r.status===200){off=end;tries=0;continue}
+      if(r.status===409&&typeof r.d.received==='number'){off=r.d.received;continue}
+      if(r.status===403||r.status===404||r.status===413){fail(r.d.error||`Upload ditolak (${r.status}).`);return}
+      if(++tries>4){fail(r.d.error||'Sambungan terputus. Cuba lagi.');return}
+      upMsg(`Potongan gagal, mencuba semula (${tries}/4)...`);await new Promise(z=>setTimeout(z,1500*tries));
+    }
+    const fin=await jpost(`/api/upload/${uid}/finish`);
+    $('#upProg').style.display='none';
+    if(!fin.ok){upMsg(fin.d.error||'Gagal menamatkan upload.',true);return}
+    upMsg('Upload siap, mengekstrak...');wantPlay=fin.d.id;pollLib(false);
+  }finally{uploading=false;window.removeEventListener('beforeunload',stop)}
 }
 $('#bUp').onclick=()=>$('#fileIn').click();
 $('#fileIn').onchange=e=>{if(e.target.files[0])upload(e.target.files[0]);e.target.value=''};
