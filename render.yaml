@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: enjin-vn
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 120
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: GITHUB_REPO
+        sync: false
