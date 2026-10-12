@@ -54,8 +54,12 @@ import time
 import zipfile
 from pathlib import Path
 
-import py7zr
 import requests
+
+try:  # 7z pilihan: app tetap boleh hidup tanpa py7zr (zip masih berfungsi)
+    import py7zr
+except ImportError:
+    py7zr = None
 from flask import Flask, Response, abort, jsonify, request, send_from_directory
 
 BASE = Path(__file__).resolve().parent
@@ -315,6 +319,8 @@ def safe_extract(apath, out):
                 z.extract(i, out)
         return total
     if kind == "7z":
+        if py7zr is None:
+            raise ValueError("Sokongan .7z tidak dipasang pada server (py7zr tiada).")
         with py7zr.SevenZipFile(apath, "r") as a:
             files = a.files
             total = sum(getattr(f, "uncompressed", 0) or 0 for f in files)
