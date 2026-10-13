@@ -10,6 +10,9 @@ Cara kerja:
      Jika GITHUB_REPO + GITHUB_TOKEN ditetapkan, arkib turut disimpan ke GitHub Release
      (dipecah automatik kepada bahagian <2 GB kerana had 2 GB/fail GitHub) supaya game kekal
      walaupun server restart. Selepas itu ia dimuat turun semula daripada GitHub bila perlu.
+     Arkib yang BUKAN format .vn (cth. game Artemis dengan root.pfs) tetap disimpan ke GitHub
+     sebagai arkib biasa ("disimpan sahaja"); butang "Simpan fail" memuat turunnya semula.
+     Gunakan repo PERSENDIRIAN (private) untuk fail yang bukan milik anda sendiri.
   B. GITHUB (pilihan): upload .zip/.7z ke GitHub (folder `games/` atau Release asset);
      senarai dikesan automatik, tekan "Muat turun & main".
   Butang "Padam cache" membuang game daripada server.
@@ -67,7 +70,9 @@ try:  # 7z pilihan: app tetap boleh hidup tanpa py7zr (zip masih berfungsi)
     import py7zr
 except ImportError:
     py7zr = None
-from flask import Flask, Response, abort, jsonify, request, send_from_directory
+from urllib.parse import quote
+
+from flask import Flask, Response, abort, jsonify, request, send_file, send_from_directory
 
 BASE = Path(__file__).resolve().parent
 CACHE = Path(os.environ.get("CACHE_DIR", BASE / "cache")).resolve()
@@ -237,7 +242,7 @@ def fetch_sources():
     def asset_part(a):
         return {"url": a["url"] if GH_TOKEN else a["browser_download_url"],
                 "accept": "application/octet-stream" if GH_TOKEN else "*/*",
-                "size": a["size"], "asset_id": a["id"]}
+                "size": a["size"], "asset_id": a["id"], "fname": a["name"]}
 
     if GH_REPO:
         if GH_RELEASES:
@@ -268,9 +273,9 @@ def fetch_sources():
                 for f in data or []:
                     if f.get("type") == "file":
                         if GH_TOKEN:
-                            part = {"url": f["url"], "accept": "application/vnd.github.raw", "size": f["size"]}
+                            part = {"url": f["url"], "accept": "application/vnd.github.raw", "size": f["size"], "fname": f["name"]}
                         elif f.get("download_url"):
-                            part = {"url": f["download_url"], "accept": "*/*", "size": f["size"]}
+                            part = {"url": f["download_url"], "accept": "*/*", "size": f["size"], "fname": f["name"]}
                         else:
                             continue
                         add(f["name"], f["size"], "github", parts=[part])
@@ -364,20 +369,64 @@ def safe_extract(apath, out):
     raise ValueError("Fail bukan arkib .zip atau .7z yang sah.")
 
 
+class NotPlayable(ValueError):
+    """Arkib sah tetapi tiada skrip .vn (tidak boleh dimainkan oleh enjin ini)."""
+
+
+def archive_entries(apath):
+    """Senarai (nama, saiz) dalam arkib tanpa mengekstrak, atau None jika tidak dapat dibaca."""
+    kind = sniff(apath)
+    if kind == "zip":
+        with zipfile.ZipFile(apath) as z:
+            return [(i.filename, i.file_size) for i in z.infolist()]
+    if kind == "7z" and py7zr is not None:
+        with py7zr.SevenZipFile(apath, "r") as a:
+            return [(f.filename, getattr(f, "uncompressed", 0) or 0) for f in a.files]
+    return None
+
+
+def human(n):
+    return f"{n / 1e9:.2f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB" if n >= 1e6 else f"{n / 1e3:.0f} KB"
+
+
+def artemis_check(ents):
+    """Cari root.pfs DAN root.pfs.000 dalam folder yang sama. Pulangkan (status, mesej)."""
+    found = {}
+    for name, size in ents:
+        base = name.replace("\\", "/").rsplit("/", 1)
+        d, f = (base[0], base[1]) if len(base) == 2 else ("", base[0])
+        if f.lower() in ("root.pfs", "root.pfs.000"):
+            found.setdefault(d, {})[f.lower()] = size
+    for d, fs in found.items():
+        if "root.pfs" in fs and "root.pfs.000" in fs:
+            return "complete", (f"Pakej Artemis lengkap: root.pfs ({human(fs['root.pfs'])}) dan "
+                                f"root.pfs.000 ({human(fs['root.pfs.000'])}) dijumpai. Enjin ini tidak boleh "
+                                f"memainkannya (guna Artroid atau .exe asal); arkib disimpan sahaja.")
+    if found:
+        have = sorted({k for fs in found.values() for k in fs})
+        miss = [x for x in ("root.pfs", "root.pfs.000") if x not in have]
+        return "partial", f"Pakej Artemis tidak lengkap: {', '.join(miss)} tiada dalam arkib."
+    return "none", ""
+
+
 def finalize(gid, job, tmp, apath, name, source, delete_archive=True):
     """Ekstrak arkib dalam tmp, cari root game, dan letak ke cache."""
     if not sniff(apath):
         raise ValueError("Fail bukan arkib .zip atau .7z yang sah.")
     job["state"] = "extracting"
+    ents = archive_entries(apath)
+    if ents is not None and not any(n.lower().endswith(".vn") for n, _ in ents):
+        status, msg = artemis_check(ents)  # tidak perlu ekstrak
+        if status == "complete":
+            raise NotPlayable(msg)
+        if status == "partial":
+            raise ValueError(msg)
+        raise ValueError("Arkib ditolak: tiada fail .vn, dan root.pfs + root.pfs.000 (game Artemis) tidak dijumpai.")
     size = safe_extract(apath, tmp / "files")
     if delete_archive:
         Path(apath).unlink()
     root = find_root(tmp / "files")
     if root is None:
-        base = tmp / "files"
-        if any(base.rglob("*.pfs")) or any(base.rglob("*.pfs.000")) or any(base.rglob("system.ini")):
-            raise ValueError("Ini game format Artemis (root.pfs). Enjin ini hanya menjalankan skrip .vn, "
-                             "jadi game ini tidak boleh dimainkan di sini.")
         raise ValueError("Tiada fail .vn dijumpai dalam arkib (letak skrip dalam scripts/ atau terus di root).")
     meta = {"name": name, "root": str(root.relative_to(tmp / "files")) or ".",
             "size": size, "time": int(time.time()), "source": source}
@@ -589,10 +638,19 @@ def publish_github(gid, apath, ext, gh):
 def run_upload_job(gid, apath, name, ext):
     job = JOBS[gid]
     tmp = CACHE / f".{gid}.tmp"
+    playable, note = True, ""
     try:
         shutil.rmtree(tmp, ignore_errors=True)
         tmp.mkdir(parents=True)
         finalize(gid, job, tmp, apath, name, "upload", delete_archive=False)
+    except NotPlayable as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        playable, note = False, str(e)
+        if not GH_WRITE:  # tiada tempat untuk menyimpannya
+            fail(job, tmp, f"{note} Tetapkan GITHUB_REPO + GITHUB_TOKEN untuk menyimpannya ke GitHub.")
+            job.pop("gh", None)
+            Path(apath).unlink(missing_ok=True)
+            return
     except Exception as e:
         fail(job, tmp, e)
         job.pop("gh", None)
@@ -607,6 +665,9 @@ def run_upload_job(gid, apath, name, ext):
         except Exception as e:
             gh["state"] = "error"
             gh["error"] = str(e)[:200]
+    if not playable:
+        job["state"] = "stored"
+        job["error"] = note
     Path(apath).unlink(missing_ok=True)
 
 
@@ -709,6 +770,37 @@ def upload_finish(uid):
     return jsonify(id=gid, name=name)
 
 
+@app.get("/api/games/<gid>/archive")
+def api_archive(gid):
+    """Muat turun arkib asal (disambung daripada bahagian GitHub) ke komputer."""
+    if not SAFE.match(gid):
+        abort(400)
+    if ADMIN and not hmac.compare_digest(request.args.get("pw", "").encode(), ADMIN.encode()):
+        return jsonify(error="Kata laluan admin diperlukan atau salah."), 403
+    it = remote()[0].get(gid) or remote(force=True)[0].get(gid)
+    if not it:
+        return jsonify(error="Arkib tidak dijumpai dalam sumber."), 404
+    if it["source"] == "local":
+        return send_file(it["path"], as_attachment=True)
+    parts = it["parts"]
+    m = re.search(r"\.(zip|7z)(\.\d{3})?$", parts[0].get("fname", ""), re.I)
+    fname = f"{it['name']}.{m.group(1).lower() if m else 'zip'}"
+    total = sum(p.get("size") or 0 for p in parts)
+
+    def gen():
+        for pt in parts:
+            hdr = {"User-Agent": "vn-engine", "Accept": pt.get("accept", "*/*")}
+            if GH_TOKEN and pt["url"].startswith("https://api.github.com/"):
+                hdr["Authorization"] = f"Bearer {GH_TOKEN}"
+            with requests.get(pt["url"], stream=True, timeout=30, allow_redirects=True, headers=hdr) as r:
+                r.raise_for_status()
+                yield from r.iter_content(1 << 20)
+
+    return Response(gen(), mimetype="application/octet-stream",
+                    headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}",
+                             "Content-Length": str(total)})
+
+
 @app.delete("/api/games/<gid>/github")
 def api_delete_github(gid):
     d = deny()
@@ -753,7 +845,7 @@ def api_games():
     for gid, g in sorted(games.items()):
         m = cached_meta(gid)
         j = JOBS.get(gid)
-        if j and j["state"] in ("downloading", "extracting", "error"):
+        if j and j["state"] in ("downloading", "extracting", "error", "stored"):
             g.update(state=j["state"], done=j["done"], total=j["total"], error=j["error"])
         elif m:
             g.update(state="ready", done=0, total=0, error="")
@@ -1058,11 +1150,12 @@ const libOpen=()=>$('#lib').style.display==='block';
 
 function makeRow(g){
   const el=document.createElement('div');el.className='game';
-  el.innerHTML='<div><div class="gn"></div><div class="gm"></div></div><div class="acts"><button class="main"></button><button class="del">Padam cache</button><button class="delgh del">Padam dari GitHub</button></div><div class="prog"><i></i></div>';
-  const r={el,gn:el.querySelector('.gn'),gm:el.querySelector('.gm'),main:el.querySelector('.main'),del:el.querySelector('.del'),delgh:el.querySelector('.delgh'),prog:el.querySelector('.prog'),bar:el.querySelector('.prog i'),id:g.id,state:'none'};
+  el.innerHTML='<div><div class="gn"></div><div class="gm"></div></div><div class="acts"><button class="main"></button><button class="del">Padam cache</button><button class="dl">Simpan fail</button><button class="delgh del">Padam dari GitHub</button></div><div class="prog"><i></i></div>';
+  const r={el,gn:el.querySelector('.gn'),gm:el.querySelector('.gm'),main:el.querySelector('.main'),del:el.querySelector('.del'),delgh:el.querySelector('.delgh'),dl:el.querySelector('.dl'),prog:el.querySelector('.prog'),bar:el.querySelector('.prog i'),id:g.id,state:'none'};
   r.main.onclick=()=>onMain(r.id,r.state);
   r.del.onclick=()=>onDelete(r.id,r.gn.textContent);
   r.delgh.onclick=()=>onDeleteGh(r.id,r.gn.textContent);
+  r.dl.onclick=()=>{const pw=$('#adminPw').value;location.href=`/api/games/${r.id}/archive`+(pw?'?pw='+encodeURIComponent(pw):'')};
   $('#libList').appendChild(el);rows[g.id]=r;return r;
 }
 function updRow(g){
@@ -1074,6 +1167,7 @@ function updRow(g){
   else if(g.state==='extracting'){m='Mengekstrak fail...'}
   else if(g.state==='ready'){m=`Dalam cache, ${fmt(g.cached_size)}`}
   else if(g.state==='error'){m='Ralat: '+g.error;r.gm.className='gm err'}
+  else if(g.state==='stored'){m='Disimpan sahaja: '+g.error}
   else{m=(g.size?fmt(g.size)+', ':'')+src+', belum dimuat turun'}
   if(g.state==='extracting'&&!g.total)m='Mengekstrak fail...';
   const gh=g.gh,ghActive=!!gh&&(gh.state==='waiting'||gh.state==='uploading');
@@ -1089,9 +1183,10 @@ function updRow(g){
   r.bar.style.width=(ghActive&&gh.total?Math.min(100,Math.round(gh.done*100/gh.total)):g.state==='extracting'?100:pct)+'%';
   r.main.textContent=({none:'Muat turun & main',downloading:'Memuat turun...',extracting:'Mengekstrak...',ready:'Main',error:'Cuba lagi'})[g.state];
   r.main.disabled=g.state==='downloading'||g.state==='extracting';
-  r.main.style.display=(g.state==='error'&&g.source==='upload')?'none':'';
-  r.del.textContent=g.state==='error'?'Buang':'Padam cache';
-  r.del.style.display=(g.state==='ready'||g.state==='error')?'':'none';
+  r.main.style.display=((g.state==='error'&&g.source==='upload')||g.state==='stored')?'none':'';
+  r.dl.style.display=(['release','github','local'].includes(g.source)&&['none','ready','stored'].includes(g.state))?'':'none';
+  r.del.textContent=g.state==='ready'?'Padam cache':'Buang';
+  r.del.style.display=(g.state==='ready'||g.state==='error'||g.state==='stored')?'':'none';
   r.del.disabled=active;
   r.delgh.style.display=(g.source==='release'&&LIB.github_write&&g.state!=='downloading'&&g.state!=='extracting')?'':'none';
   r.delgh.disabled=active;
@@ -1102,7 +1197,7 @@ function renderLib(d){
   $('#libSub').textContent=d.repo?`Upload terus, atau dari github.com/${d.repo}`:'Upload game, kemudian kongsi pautan ini dengan kawan';
   $('#libErr').textContent=d.error||'';
   $('#adminRow').style.display=d.locked?'block':'none';
-  $('#dropNote').textContent='Arkib mesti mengandungi folder game dengan skrip .vn. Fail besar (GB) dihantar berpotong-potong, jangan tutup tab semasa upload. '+(d.github_write?'Game turut disimpan ke GitHub (dipecah automatik jika >2 GB) supaya kekal.':'GitHub belum ditetapkan: game hanya disimpan sementara pada server.');
+  $('#dropNote').textContent='Fail besar (GB) dihantar berpotong-potong, jangan tutup tab semasa upload. Arkib dengan skrip .vn boleh dimainkan. Pakej Artemis diterima hanya jika root.pfs dan root.pfs.000 kedua-duanya dijumpai (disimpan sahaja, tidak boleh dimainkan di sini). '+(d.github_write?'Semua arkib disimpan ke GitHub (dipecah automatik jika >2 GB).':'GitHub belum ditetapkan: fail hanya disimpan sementara pada server.');
   const ids=new Set(d.games.map(g=>g.id));
   for(const id of Object.keys(rows)) if(!ids.has(id)){rows[id].el.remove();delete rows[id]}
   d.games.forEach(updRow);
@@ -1112,7 +1207,7 @@ function renderLib(d){
   if(wantPlay){
     const g=d.games.find(x=>x.id===wantPlay);
     if(g&&g.state==='ready'){const id=wantPlay;wantPlay=null;playGame(id)}
-    else if(!g||g.state==='error'||g.state==='none'&&!g){wantPlay=null}
+    else if(!g||g.state==='error'||g.state==='stored'||g.state==='none'&&!g){wantPlay=null}
   }
 }
 async function pollLib(force){
@@ -1229,7 +1324,7 @@ async function boot(name){
 }
 $('#bRestart').onclick=()=>{$('#ovEnd').style.display='none';st=fresh();renderBg();renderSprites();renderBgm();step()};
 
-$('#stage').addEventListener('click',e=>{if(!e.target.closest('#bar,.ov,#choices'))next()});
+$('#stage').addEventListener('click',e=>{if(!e.target.closest('#bar,.ov,.choices'))next()});
 document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>b.parentElement.style.display='none');
 $('#bAuto').onclick=()=>{setSkip(false);auto=!auto;syncBtns();if(auto&&!typing)afterText()};
 $('#bSkip').onclick=()=>setSkip(!skip);
