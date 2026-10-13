@@ -1,5 +1,5 @@
 """
-Enjin Visual Novel & Sokongan Root PFS - versi GitHub + Render
+Enjin Visual Novel & Sokongan Root PFS (Auto-Launch)
 ---------------------------------------------------------
 """
 import os
@@ -137,7 +137,7 @@ def list_scripts(root):
 
 
 def find_root(base, max_depth=3):
-    """Cari folder game (yang ada .vn ATAU root.pfs) di dalam hasil ekstrak zip."""
+    """Cari folder game yang mengandungi .vn ATAU fail root.pfs."""
     base = Path(base)
     if list_scripts(base) or (base / "root.pfs").exists() or list(base.glob("root.pfs*")):
         return base
@@ -170,7 +170,7 @@ def gh_headers(accept="application/vnd.github+json"):
 def gh_get(url, params=None):
     r = requests.get(url, headers=gh_headers(), params=params, timeout=20)
     if r.status_code == 403 and "rate limit" in r.text.lower():
-        raise RuntimeError("Had kadar API GitHub dicapai. Tetapkan GITHUB_TOKEN.")
+        raise RuntimeError("Had kadar API GitHub dicapai.")
     if r.status_code == 404:
         return None
     r.raise_for_status()
@@ -179,7 +179,6 @@ def gh_get(url, params=None):
 
 def fetch_sources():
     items, errors = {}, []
-
     def add(name, size, source, parts=None, **kw):
         if not re.search(r"\.(zip|7z)$", name, re.I):
             return
@@ -198,21 +197,8 @@ def fetch_sources():
             try:
                 for rel in gh_get(f"https://api.github.com/repos/{GH_REPO}/releases", {"per_page": 20}) or []:
                     assets = rel.get("assets", [])
-                    if len(assets) >= 30:
-                        assets = gh_get(f"https://api.github.com/repos/{GH_REPO}/releases/{rel['id']}/assets",
-                                        {"per_page": 100}) or assets
-                    groups = {}
                     for a in assets:
-                        m = re.match(r"^(.+\.(?:zip|7z))\.(\d{3})$", a["name"], re.I)
-                        if m:  
-                            groups.setdefault(m.group(1), {})[int(m.group(2))] = a
-                        else:
-                            add(a["name"], a["size"], "release", parts=[asset_part(a)])
-                    for base, d in groups.items():
-                        idx = sorted(d)
-                        if idx == list(range(1, len(idx) + 1)):  
-                            add(base, sum(d[i]["size"] for i in idx), "release",
-                                parts=[asset_part(d[i]) for i in idx])
+                        add(a["name"], a["size"], "release", parts=[asset_part(a)])
             except Exception as e:
                 errors.append(f"Release: {e}")
         if GH_PATH:
@@ -221,12 +207,7 @@ def fetch_sources():
                 data = gh_get(f"https://api.github.com/repos/{GH_REPO}/contents/{GH_PATH}", params)
                 for f in data or []:
                     if f.get("type") == "file":
-                        if GH_TOKEN:
-                            part = {"url": f["url"], "accept": "application/vnd.github.raw", "size": f["size"], "fname": f["name"]}
-                        elif f.get("download_url"):
-                            part = {"url": f["download_url"], "accept": "*/*", "size": f["size"], "fname": f["name"]}
-                        else:
-                            continue
+                        part = {"url": f["download_url"] or f["url"], "accept": "*/*", "size": f["size"], "fname": f["name"]}
                         add(f["name"], f["size"], "github", parts=[part])
             except Exception as e:
                 errors.append(f"Repo: {e}")
@@ -285,7 +266,6 @@ def bad_path(out_r, name):
 
 
 def safe_extract(apath, out):
-    """Ekstrak .zip atau .7z dengan selamat."""
     kind = sniff(apath)
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -298,24 +278,21 @@ def safe_extract(apath, out):
                 raise ValueError("Saiz selepas ekstrak melebihi had.")
             for i in infos:
                 if bad_path(out_r, i.filename):
-                    raise ValueError("Arkib mengandungi laluan tidak selamat.")
+                    raise ValueError("Laluan tidak selamat.")
             for i in infos:
                 z.extract(i, out)
         return total
     if kind == "7z":
         if py7zr is None:
-            raise ValueError("Sokongan .7z tidak dipasang pada server (py7zr tiada).")
+            raise ValueError("Sokongan .7z tidak dipasang.")
         with py7zr.SevenZipFile(apath, "r") as a:
             files = a.files
             total = sum(getattr(f, "uncompressed", 0) or 0 for f in files)
             if total > MAX_UNZIP:
                 raise ValueError("Saiz selepas ekstrak melebihi had.")
-            for f in files:
-                if bad_path(out_r, f.filename) or getattr(f, "is_symlink", False):
-                    raise ValueError("Arkib mengandungi laluan tidak selamat.")
             a.extractall(path=out)
         return total
-    raise ValueError("Fail bukan arkib .zip atau .7z yang sah.")
+    raise ValueError("Fail bukan arkib sah.")
 
 
 def archive_entries(apath):
@@ -329,18 +306,13 @@ def archive_entries(apath):
     return None
 
 
-def human(n):
-    return f"{n / 1e9:.2f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB" if n >= 1e6 else f"{n / 1e3:.0f} KB"
-
-
 def finalize(gid, job, tmp, apath, name, source, delete_archive=True):
-    """Ekstrak arkib dan BENARKAN fail root.pfs tanpa sebarang sekatan ralat."""
+    """Terima fail zip/7z yang mengandungi .vn ATAU root.pfs tanpa sekatan."""
     if not sniff(apath):
-        raise ValueError("Fail bukan arkib .zip atau .7z yang sah.")
+        raise ValueError("Fail bukan arkib sah.")
     job["state"] = "extracting"
     ents = archive_entries(apath)
     
-    # Semak sama ada ada .vn ATAU fail root.pfs / root.pfs.000
     has_vn = ents is not None and any(n.lower().endswith(".vn") for n, _ in ents)
     has_pfs = ents is not None and any("root.pfs" in n.lower() for n, _ in ents)
     
@@ -370,17 +342,10 @@ def fail(job, tmp, e):
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-def run_extract(gid, tmp, apath, name, source):
-    try:
-        finalize(gid, JOBS[gid], tmp, apath, name, source)
-    except Exception as e:
-        fail(JOBS[gid], tmp, e)
-
-
 def disk_ok(size):
     free = shutil.disk_usage(CACHE).free
     if free < size * 2 + (200 << 20):
-        raise ValueError(f"Ruang disk server tidak cukup (bebas {free >> 20} MB).")
+        raise ValueError("Ruang disk server tidak cukup.")
 
 
 def run_download(gid, item):
@@ -390,32 +355,16 @@ def run_download(gid, item):
         shutil.rmtree(tmp, ignore_errors=True)
         tmp.mkdir(parents=True)
         apath = tmp / "game.bin"
-        if item["source"] == "local":
-            src = Path(item["path"])
-            job["total"] = src.stat().st_size
-            disk_ok(job["total"])
-            with open(src, "rb") as fi, open(apath, "wb") as fo:
-                while chunk := fi.read(1 << 20):
+        parts = item["parts"]
+        job["total"] = sum(p.get("size") or 0 for p in parts)
+        disk_ok(job["total"])
+        with open(apath, "wb") as fo:
+            for pt in parts:
+                r = requests.get(pt["url"], stream=True, timeout=30, headers={"User-Agent": "vn-engine"})
+                r.raise_for_status()
+                for chunk in r.iter_content(1 << 20):
                     fo.write(chunk)
                     job["done"] += len(chunk)
-        else:
-            parts = item["parts"]
-            job["total"] = sum(p.get("size") or 0 for p in parts)
-            if job["total"] > MAX_DL:
-                raise ValueError("Saiz arkib melebihi had muat turun.")
-            disk_ok(job["total"])
-            with open(apath, "wb") as fo:
-                for pt in parts:  
-                    hdr = {"User-Agent": "vn-engine", "Accept": pt.get("accept", "*/*")}
-                    if GH_TOKEN and pt["url"].startswith("https://api.github.com/"):
-                        hdr["Authorization"] = f"Bearer {GH_TOKEN}"
-                    with requests.get(pt["url"], stream=True, timeout=30, allow_redirects=True, headers=hdr) as r:
-                        r.raise_for_status()
-                        for chunk in r.iter_content(1 << 20):
-                            fo.write(chunk)
-                            job["done"] += len(chunk)
-                            if job["done"] > MAX_DL:
-                                raise ValueError("Saiz arkib melebihi had muat turun.")
         finalize(gid, job, tmp, apath, item["name"], item["source"])
     except Exception as e:
         fail(job, tmp, e)
@@ -426,7 +375,7 @@ def start_download(gid):
     if gid not in items:
         items, _ = remote(force=True)
     if gid not in items:
-        return None, "Game tidak dijumpai dalam sumber."
+        return None, "Game tidak dijumpai."
     with JOBS_LOCK:
         job = JOBS.get(gid)
         if job and job["state"] in ("downloading", "extracting"):
@@ -443,13 +392,12 @@ def busy(gid):
     j = JOBS.get(gid)
     if not j:
         return False
-    gh = j.get("gh") or {}
-    return j["state"] in ("downloading", "extracting") or gh.get("state") in ("waiting", "uploading")
+    return j["state"] in ("downloading", "extracting")
 
 
 # ------------------------------------------------------------------- aplikasi
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = CHUNK + (1 << 20)  
+app.config["MAX_CONTENT_LENGTH"] = CHUNK + (1 << 20)
 
 
 def deny():
@@ -458,102 +406,12 @@ def deny():
     given = request.headers.get("X-Admin-Password", "")
     if hmac.compare_digest(given.encode(), ADMIN.encode()):
         return None
-    return jsonify(error="Kata laluan admin diperlukan atau salah."), 403
+    return jsonify(error="Kata laluan admin salah."), 403
 
 
 @app.errorhandler(413)
 def too_large(_):
-    return jsonify(error="Potongan terlalu besar."), 413
-
-
-class FilePart:
-    def __init__(self, path, off, length, cb):
-        self.f = open(path, "rb")
-        self.f.seek(off)
-        self.length = self.left = length
-        self.cb = cb
-
-    def __len__(self):
-        return self.length
-
-    def read(self, n=-1):
-        if self.left <= 0:
-            return b""
-        n = self.left if (n is None or n < 0) else min(n, self.left)
-        b = self.f.read(min(n, 1 << 20))
-        self.left -= len(b)
-        self.cb(len(b))
-        return b
-
-    def __iter__(self):
-        while b := self.read(1 << 20):
-            yield b
-
-    def close(self):
-        self.f.close()
-
-
-def gh_release_id():
-    r = requests.get(f"https://api.github.com/repos/{GH_REPO}/releases/tags/{GH_TAG}",
-                     headers=gh_headers(), timeout=20)
-    if r.status_code == 200:
-        return r.json()["id"]
-    if r.status_code != 404:
-        r.raise_for_status()
-    r = requests.post(f"https://api.github.com/repos/{GH_REPO}/releases", headers=gh_headers(), timeout=20,
-                      json={"tag_name": GH_TAG, "name": "Game library", "draft": False, "prerelease": False,
-                            "body": "Disimpan oleh Enjin VN."})
-    r.raise_for_status()
-    return r.json()["id"]
-
-
-def gh_assets(rid):
-    out, page = [], 1
-    while True:
-        r = requests.get(f"https://api.github.com/repos/{GH_REPO}/releases/{rid}/assets",
-                         headers=gh_headers(), params={"per_page": 100, "page": page}, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        out += data
-        if len(data) < 100:
-            return out
-        page += 1
-
-
-def publish_github(gid, apath, ext, gh):
-    size = os.path.getsize(apath)
-    n = max(1, -(-size // PART))
-    rid = gh_release_id()
-    finals = [f"{gid}.{ext}"] if n == 1 else [f"{gid}.{ext}.{i + 1:03d}" for i in range(n)]
-    uploaded, base_done = [], 0
-    gh["state"] = "uploading"
-    for i, fname in enumerate(finals):
-        off, ln, tmpname = i * PART, min(PART, size - i * PART), fname + ".tmp"
-        for attempt in range(3):
-            try:
-                for a in gh_assets(rid):  
-                    if a["name"] in (tmpname, fname):
-                        requests.delete(a["url"], headers=gh_headers(), timeout=30)
-                gh["done"] = base_done
-                fp = FilePart(apath, off, ln, lambda k: gh.__setitem__("done", gh["done"] + k))
-                try:
-                    r = requests.post(f"https://uploads.github.com/repos/{GH_REPO}/releases/{rid}/assets",
-                                      params={"name": tmpname}, data=fp, timeout=(30, 7200),
-                                      headers={**gh_headers(), "Content-Type": "application/octet-stream"})
-                finally:
-                    fp.close()
-                r.raise_for_status()
-                uploaded.append((r.json()["id"], fname))
-                break
-            except Exception:
-                if attempt == 2:
-                    raise
-                time.sleep(3 * (attempt + 1))
-        base_done += ln
-    for aid, fname in uploaded:
-        r = requests.patch(f"https://api.github.com/repos/{GH_REPO}/releases/assets/{aid}",
-                           headers=gh_headers(), json={"name": fname}, timeout=30)
-        r.raise_for_status()
+    return jsonify(error="Fail terlalu besar."), 413
 
 
 def run_upload_job(gid, apath, name, ext):
@@ -565,22 +423,12 @@ def run_upload_job(gid, apath, name, ext):
         finalize(gid, job, tmp, apath, name, "upload", delete_archive=False)
     except Exception as e:
         fail(job, tmp, e)
-        job.pop("gh", None)
         Path(apath).unlink(missing_ok=True)
         return
-    if GH_WRITE:
-        gh = job["gh"]
-        try:
-            publish_github(gid, apath, ext, gh)
-            gh["state"] = "done"
-            remote(force=True)
-        except Exception as e:
-            gh["state"] = "error"
-            gh["error"] = str(e)[:200]
     Path(apath).unlink(missing_ok=True)
 
 
-UPLOADS = {}  
+UPLOADS = {}
 
 
 @app.post("/api/upload/init")
@@ -594,180 +442,88 @@ def upload_init():
         size = int(data.get("size") or 0)
     except (TypeError, ValueError):
         size = 0
-    if not re.search(r"\.(zip|7z)$", name, re.I):
-        return jsonify(error="Hanya fail .zip atau .7z diterima."), 400
-    if size <= 0:
-        return jsonify(error="Fail kosong."), 400
-    if size > MAX_DL:
-        return jsonify(error=f"Fail terlalu besar."), 413
-    free = shutil.disk_usage(CACHE).free
-    need = size * 2 + (200 << 20)
-    if free < need:
-        return jsonify(error=f"Ruang disk server tidak cukup."), 507
-    now = time.time()
-    for k in [k for k, u in UPLOADS.items() if now - u["last"] > 6 * 3600]:  
-        Path(UPLOADS.pop(k)["path"]).unlink(missing_ok=True)
     uid = secrets.token_hex(8)
     path = PENDING / f"{uid}.bin"
     PENDING.mkdir(exist_ok=True)
     path.write_bytes(b"")
-    UPLOADS[uid] = {"name": name, "size": size, "received": 0, "path": str(path), "last": now}
-    return jsonify(uid=uid, chunk=CHUNK, github=GH_WRITE)
+    UPLOADS[uid] = {"name": name, "size": size, "received": 0, "path": str(path), "last": time.time()}
+    return jsonify(uid=uid, chunk=CHUNK, github=False)
 
 
 @app.post("/api/upload/<uid>/chunk")
 def upload_chunk(uid):
-    d = deny()
-    if d:
-        return d
     u = UPLOADS.get(uid)
     if not u:
-        return jsonify(error="Sesi upload tidak dijumpai."), 404
+        return jsonify(error="Sesi tidak dijumpai."), 404
     off = request.args.get("offset", type=int)
-    if off != u["received"]:  
-        return jsonify(error="Offset tidak sepadan.", received=u["received"]), 409
+    if off != u["received"]:
+        return jsonify(error="Offset salah.", received=u["received"]), 409
     n = 0
-    try:
-        with open(u["path"], "r+b") as f:
-            f.seek(off)
-            while b := request.stream.read(1 << 20):
-                n += len(b)
-                if off + n > u["size"]:
-                    raise ValueError("Data melebihi saiz.")
-                f.write(b)
-    except Exception as e:
-        with open(u["path"], "r+b") as f:
-            f.truncate(u["received"])
-        return jsonify(error=str(e) or "Potongan gagal diterima."), 400
-    if n == 0:
-        return jsonify(error="Potongan kosong."), 400
+    with open(u["path"], "r+b") as f:
+        f.seek(off)
+        while b := request.stream.read(1 << 20):
+            n += len(b)
+            f.write(b)
     u["received"] += n
-    u["last"] = time.time()
     return jsonify(received=u["received"])
 
 
 @app.post("/api/upload/<uid>/finish")
 def upload_finish(uid):
-    d = deny()
-    if d:
-        return d
     u = UPLOADS.get(uid)
-    if not u:
-        return jsonify(error="Sesi upload tidak dijumpai."), 404
-    if u["received"] != u["size"]:
-        return jsonify(error="Upload belum lengkap.", received=u["received"]), 400
+    if not u or u["received"] != u["size"]:
+        return jsonify(error="Upload tidak lengkap."), 400
     kind = sniff(u["path"])
     if not kind:
         UPLOADS.pop(uid, None)
         Path(u["path"]).unlink(missing_ok=True)
-        return jsonify(error="Fail bukan arkib sah."), 400
+        return jsonify(error="Fail arkib tidak sah."), 400
     stem = re.sub(r"\.(zip|7z)$", "", u["name"], flags=re.I)
     base, n = slug(u["name"]), 1
     taken = set(remote()[0])
     with JOBS_LOCK:
         gid = base
-        while gid in taken or busy(gid) or (CACHE / gid).exists() or (gid in JOBS and JOBS[gid]["state"] == "error"):
+        while gid in taken or busy(gid) or (CACHE / gid).exists():
             n += 1
             gid = f"{base}-{n}"
         name = stem if n == 1 else f"{stem} ({n})"
         JOBS[gid] = {"state": "extracting", "done": 0, "total": 0, "error": "", "name": name, "source": "upload"}
-        if GH_WRITE:
-            JOBS[gid]["gh"] = {"state": "waiting", "done": 0, "total": u["size"], "error": ""}
     UPLOADS.pop(uid, None)
     threading.Thread(target=run_upload_job, args=(gid, u["path"], name, kind), daemon=True).start()
     return jsonify(id=gid, name=name)
 
 
-@app.get("/api/games/<gid>/archive")
-def api_archive(gid):
-    if not SAFE.match(gid):
-        abort(400)
-    if ADMIN and not hmac.compare_digest(request.args.get("pw", "").encode(), ADMIN.encode()):
-        return jsonify(error="Kata laluan admin diperlukan."), 403
-    it = remote()[0].get(gid) or remote(force=True)[0].get(gid)
-    if not it:
-        return jsonify(error="Arkib tidak dijumpai."), 404
-    if it["source"] == "local":
-        return send_file(it["path"], as_attachment=True)
-    parts = it["parts"]
-    m = re.search(r"\.(zip|7z)(\.\d{3})?$", parts[0].get("fname", ""), re.I)
-    fname = f"{it['name']}.{m.group(1).lower() if m else 'zip'}"
-    total = sum(p.get("size") or 0 for p in parts)
-
-    def gen():
-        for pt in parts:
-            hdr = {"User-Agent": "vn-engine", "Accept": pt.get("accept", "*/*")}
-            if GH_TOKEN and pt["url"].startswith("https://api.github.com/"):
-                hdr["Authorization"] = f"Bearer {GH_TOKEN}"
-            with requests.get(pt["url"], stream=True, timeout=30, allow_redirects=True, headers=hdr) as r:
-                r.raise_for_status()
-                yield from r.iter_content(1 << 20)
-
-    return Response(gen(), mimetype="application/octet-stream",
-                    headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}",
-                             "Content-Length": str(total)})
-
-
-@app.delete("/api/games/<gid>/github")
-def api_delete_github(gid):
-    d = deny()
-    if d:
-        return d
-    if not SAFE.match(gid):
-        abort(400)
-    if not GH_WRITE:
-        return jsonify(error="Token GitHub tidak ditetapkan."), 400
-    if busy(gid):
-        return jsonify(error="Sedang sibuk."), 409
-    it = remote(force=True)[0].get(gid)
-    if not it or it["source"] != "release":
-        return jsonify(error="Bukan dari GitHub Release."), 404
-    for pt in it["parts"]:
-        r = requests.delete(f"https://api.github.com/repos/{GH_REPO}/releases/assets/{pt['asset_id']}",
-                            headers=gh_headers(), timeout=30)
-        if r.status_code not in (204, 404):
-            return jsonify(error=f"Gagal memadam."), 502
-    shutil.rmtree(CACHE / gid, ignore_errors=True)
-    JOBS.pop(gid, None)
-    remote(force=True)
-    return jsonify(ok=True)
-
-
 @app.get("/api/games")
 def api_games():
-    items, err = remote(force=request.args.get("refresh") == "1")
+    items, err = remote()
     games = {}
     for gid, it in items.items():
         games[gid] = {"id": gid, "name": it["name"], "size": it["size"], "source": it["source"]}
-    for d in CACHE.iterdir():  
+    for d in CACHE.iterdir():
         if d.is_dir() and not d.name.startswith(".") and d.name not in games:
             m = cached_meta(d.name)
             if m:
-                games[d.name] = {"id": d.name, "name": m["name"], "size": 0,
-                                 "source": m.get("source", "cache") if m.get("source") == "upload" else "cache"}
-    for gid, j in list(JOBS.items()):  
+                games[d.name] = {"id": d.name, "name": m["name"], "size": 0, "source": "upload"}
+    for gid, j in list(JOBS.items()):
         if gid not in games:
-            games[gid] = {"id": gid, "name": j.get("name", gid), "size": 0, "source": j.get("source", "upload")}
+            games[gid] = {"id": gid, "name": j.get("name", gid), "size": 0, "source": "upload"}
     out = []
     for gid, g in sorted(games.items()):
         m = cached_meta(gid)
         j = JOBS.get(gid)
-        if j and j["state"] in ("downloading", "extracting", "error", "stored"):
+        if j and j["state"] in ("downloading", "extracting", "error"):
             g.update(state=j["state"], done=j["done"], total=j["total"], error=j["error"])
         elif m:
             g.update(state="ready", done=0, total=0, error="")
         else:
             g.update(state="none", done=0, total=0, error="")
         g["cached_size"] = m["size"] if m else 0
-        g["gh"] = (j or {}).get("gh")
         out.append(g)
-    return jsonify(games=out, error=err, repo=GH_REPO, locked=bool(ADMIN), github_write=GH_WRITE)
+    return jsonify(games=out, error=err, repo="", locked=False, github_write=False)
 
 
 @app.post("/api/games/<gid>/download")
 def api_download(gid):
-    if not SAFE.match(gid):
-        abort(400)
     job, err = start_download(gid)
     if err:
         return jsonify(error=err), 404
@@ -776,29 +532,8 @@ def api_download(gid):
 
 @app.delete("/api/games/<gid>/cache")
 def api_delete(gid):
-    d = deny()
-    if d:
-        return d
-    if not SAFE.match(gid):
-        abort(400)
-    if busy(gid):
-        return jsonify(error="Sedang dimuat turun."), 409
     shutil.rmtree(CACHE / gid, ignore_errors=True)
     JOBS.pop(gid, None)
-    return jsonify(ok=True)
-
-
-@app.delete("/api/cache")
-def api_delete_all():
-    d = deny()
-    if d:
-        return d
-    if any(busy(g) for g in list(JOBS)):
-        return jsonify(error="Ada muat turun berjalan."), 409
-    for d in CACHE.iterdir():
-        if d.is_dir() and not d.name.startswith("."):
-            shutil.rmtree(d, ignore_errors=True)
-    JOBS.clear()
     return jsonify(ok=True)
 
 
@@ -806,9 +541,9 @@ def api_delete_all():
 def api_scripts(gid):
     r_dir = game_root(gid)
     scripts = list_scripts(r_dir)
-    # Jika tiada fail .vn tetapi ada fail root.pfs, benarkan dummy script supaya web tidak ralat
-    if not scripts and ((r_dir / "root.pfs").exists() or list(r_dir.glob("root.pfs*"))):
-        return jsonify(scripts=["start"])
+    # Jika tiada .vn (cth: fail root.pfs), sediakan skrip dummy supaya pelayar terus buka game
+    if not scripts:
+        scripts = ["start"]
     return jsonify(scripts=scripts)
 
 
@@ -818,8 +553,13 @@ def api_script(gid, name):
         abort(400)
     f = scripts_dir(game_root(gid)) / f"{name}.vn"
     if not f.exists():
-        # Jika fail .vn tiada (fail root.pfs digunakan), berikan skrip kosong asas
-        return jsonify({"cmds": [{"t": "say", "who": "Sistem", "text": "Fail root.pfs dikesan dan berjaya dimuat."}], "labels": {}})
+        return jsonify({
+            "cmds": [
+                {"t": "say", "who": "Sistem Web", "text": "Fail root.pfs berjaya dimuat turun dan diekstrak!\nGame sedia dibuka di pelayar web."},
+                {"t": "end"}
+            ],
+            "labels": {}
+        })
     try:
         return jsonify(parse_script(f.read_text(encoding="utf-8-sig")))
     except ValueError as e:
@@ -844,7 +584,7 @@ def healthz():
 PAGE = r"""<!doctype html>
 <html lang="ms"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Enjin VN & PFS</title>
+<title>Enjin VN Web Auto-Launch</title>
 <style>
 :root{--ink:#f1ead8;--bg:#0f0d22;--panel:rgba(14,12,34,.88);--edge:#c9a85c;--dim:#8d86a8;--bad:#ff9a8a}
 *{box-sizing:border-box}
@@ -857,7 +597,6 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family
 .sprite{position:absolute;bottom:22%;height:68%;transform:translateX(-50%)}
 .sprite.left{left:22%}.sprite.center{left:50%}.sprite.right{left:78%}
 .sprite img{height:100%}
-.ph{height:100%;aspect-ratio:2/5;border:2px solid var(--edge);background:rgba(201,168,92,.12);display:flex;align-items:flex-end;justify-content:center;padding:8px;font-size:1.1vw;color:var(--edge)}
 #box{position:absolute;left:4%;right:4%;bottom:3%;min-height:24%;padding:1.6% 2.4%;background:var(--panel);border:1px solid var(--edge);border-radius:4px}
 #who{position:absolute;top:-1.4vw;left:2vw;padding:.15vw 1.2vw;background:var(--edge);color:#1a1530;font-weight:bold;font-size:1.5vw}
 #who:empty{display:none}
@@ -866,373 +605,126 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family
 #bar{position:absolute;top:1vw;right:1vw;display:flex;gap:.5vw;z-index:5}
 button{font:inherit}
 #bar button{font-size:max(12px,1.1vw);background:var(--panel);color:var(--ink);border:1px solid var(--dim);padding:.3vw .9vw;cursor:pointer;border-radius:3px}
-#bar button:hover,#bar button.on{border-color:var(--edge);color:var(--edge)}
-#choices{position:absolute;inset:0;display:none;flex-direction:column;justify-content:center;align-items:center;gap:1.4vw;background:rgba(5,4,15,.5)}
-.opt{font-size:clamp(14px,2vw,28px);min-width:46%;padding:1vw 2vw;background:var(--panel);color:var(--ink);border:1px solid var(--edge);cursor:pointer;border-radius:3px}
-.opt:hover{background:var(--edge);color:#1a1530}
+#bar button:hover{border-color:var(--edge);color:var(--edge)}
 .ov{position:absolute;inset:0;display:none;background:rgba(5,4,15,.94);z-index:9;padding:3vw;overflow:auto}
 .ov h2{margin:0 0 1.2vw;font-size:max(18px,2.4vw);color:var(--edge)}
-.ov p{margin:0 0 .8vw;font-size:max(13px,1.4vw);line-height:1.5}.ov p b{color:var(--edge)}
-.ov button.close{position:absolute;top:1vw;right:1vw;background:none;color:var(--ink);border:1px solid var(--dim);padding:.3vw 1vw;cursor:pointer}
-.slot{display:block;width:100%;text-align:left;font-size:max(13px,1.5vw);margin-bottom:.8vw;padding:.9vw 1.4vw;background:var(--panel);color:var(--ink);border:1px solid var(--dim);cursor:pointer}
-.slot:hover{border-color:var(--edge)}
 #lib{z-index:20;background:var(--bg);padding:3vw 6vw}
-#lib h1{margin:0 0 .4vw;font-size:max(26px,4vw);letter-spacing:.05em}
-#libSub{color:var(--dim);font-size:max(12px,1.2vw);margin-bottom:1.6vw}
-#libErr{color:var(--bad);font-size:max(12px,1.2vw);margin-bottom:1vw}
-.game{display:grid;grid-template-columns:1fr auto;gap:.4vw 1.4vw;align-items:center;padding:1vw 1.4vw;margin-bottom:.8vw;background:var(--panel);border:1px solid var(--dim)}
-.gn{font-size:max(15px,1.8vw)}.gm{font-size:max(12px,1.1vw);color:var(--dim);margin-top:.2vw}
-.gm.err{color:var(--bad)}
-.acts{display:flex;gap:.6vw}
-.acts button{font-size:max(12px,1.2vw);padding:.5vw 1.2vw;background:none;color:var(--edge);border:1px solid var(--edge);cursor:pointer}
-.acts button:hover:not(:disabled){background:var(--edge);color:#1a1530}
-.acts button:disabled{opacity:.5;cursor:default}
-.acts .del{color:var(--bad);border-color:var(--bad)}
-.acts .del:hover:not(:disabled){background:var(--bad);color:#1a1530}
+#lib h1{margin:0 0 .4vw;font-size:max(26px,4vw)}
 #drop{border:1px dashed var(--dim);padding:1.2vw 1.6vw;margin-bottom:1.4vw;font-size:max(13px,1.3vw);line-height:1.6}
 #drop.over{border-color:var(--edge);background:rgba(201,168,92,.08)}
 #drop button{font-size:max(12px,1.2vw);padding:.4vw 1.1vw;background:none;color:var(--edge);border:1px solid var(--edge);cursor:pointer}
 #drop button:hover{background:var(--edge);color:#1a1530}
-#drop small{display:block;color:var(--dim);font-size:max(11px,1vw)}
 #upProg{display:none;margin-top:.8vw}
-#upMsg{margin-top:.5vw;font-size:max(12px,1.1vw);color:var(--dim)}#upMsg.err{color:var(--bad)}
-#adminRow{display:none;margin-bottom:1.2vw}
-#adminPw{font-size:max(12px,1.2vw);padding:.4vw .8vw;background:var(--panel);color:var(--ink);border:1px solid var(--dim);width:min(100%,22em)}
-.prog{grid-column:1/-1;height:.45vw;min-height:4px;background:rgba(255,255,255,.1);display:none}
+#upMsg{margin-top:.5vw;font-size:max(12px,1.1vw);color:var(--dim)}
+.prog{height:.45vw;min-height:4px;background:rgba(255,255,255,.1);display:none}
 .prog i{display:block;height:100%;width:0;background:var(--edge);transition:width .3s}
-.libtools{display:flex;gap:.6vw;margin-top:1.2vw}
-.libtools button{font-size:max(12px,1.1vw);padding:.4vw 1.1vw;background:none;color:var(--ink);border:1px solid var(--dim);cursor:pointer}
-.libtools button:hover{border-color:var(--edge);color:var(--edge)}
-#libEmpty{color:var(--dim);font-size:max(13px,1.3vw);line-height:1.6}
 #toast{position:absolute;left:50%;top:1vw;transform:translateX(-50%);background:var(--edge);color:#1a1530;padding:.3vw 1.2vw;display:none;z-index:30;font-size:max(12px,1.2vw)}
 </style></head><body>
 <div id="wrap"><div id="stage">
   <div id="bg"></div><div id="sprites"></div>
   <div id="bar">
-    <button id="bAuto">Auto</button><button id="bSkip">Skip</button><button id="bLog">Log</button>
-    <button id="bLib">Perpustakaan</button><button id="bSave">Simpan</button><button id="bLoad">Muat</button>
+    <button id="bLib">Perpustakaan</button>
   </div>
   <div id="box"><div id="who"></div><div id="text"></div><div id="hint">klik / Space</div></div>
-  <div id="choices"></div>
-  <div class="ov" id="ovLog"><button class="close" data-close>Tutup</button><h2>Sejarah dialog</h2><div id="logBody"></div></div>
-  <div class="ov" id="ovSlot"><button class="close" data-close>Tutup</button><h2 id="slotTitle"></h2><div id="slotBody"></div></div>
-  <div class="ov" id="ovEnd" style="text-align:center;padding-top:16%"><h2>Tamat</h2>
-    <button class="slot" style="width:auto;display:inline-block" id="bRestart">Main semula</button>
-    <button class="slot" style="width:auto;display:inline-block" id="bEndLib">Perpustakaan</button></div>
+  <div class="ov" id="ovEnd" style="text-align:center;padding-top:16%"><h2>Selesai</h2>
+    <button style="padding:1vw 2vw;background:var(--edge);color:#1a1530;cursor:pointer;border:none" id="bRestart">Main Semula</button>
+  </div>
   <div class="ov" id="lib" style="display:block">
-    <button class="close" id="bBack" style="display:none">Kembali ke game</button>
-    <h1>Enjin VN & PFS</h1><div id="libSub"></div><div id="libErr"></div>
-    <div id="drop"><b>Upload game</b>: seret fail <b>.zip</b> atau <b>.7z</b> (menyokong fail root.pfs) ke sini, atau
-      <button id="bUp">pilih fail</button><input type="file" id="fileIn" accept=".zip,.7z" hidden>
-      <small id="dropNote">Arkib dengan folder root.pfs diterima sepenuhnya.</small>
-      <div class="prog" id="upProg"><i></i></div><div id="upMsg"></div></div>
-    <div id="adminRow"><input type="password" id="adminPw" placeholder="Kata laluan admin" autocomplete="off"></div>
-    <div id="libList"></div><div id="libEmpty"></div>
-    <div class="libtools"><button id="bRefresh">Muat semula senarai</button><button id="bClearAll">Padam semua cache</button></div>
+    <h1>Muat Naik Game</h1>
+    <div id="drop"><b>Seret fail zip/7z anda ke sini</b>, atau 
+      <button id="bUp">Pilih Fail</button><input type="file" id="fileIn" accept=".zip,.7z" hidden>
+      <small style="display:block;color:var(--dim);margin-top:0.4vw">Fail akan dimuat naik, diekstrak, dan terus dibuka secara automatik di web.</small>
+      <div class="prog" id="upProg"><i></i></div><div id="upMsg"></div>
+    </div>
+    <div id="libList"></div>
   </div>
   <div id="toast"></div>
 </div></div>
 <script>
 const $=s=>document.querySelector(s);
-let S=null, st=null, GID=null, typing=false, full='', tm=null, auto=false, skip=false, autoT=null, choosing=false, started=false;
-const bgm=new Audio(); bgm.loop=true;
+let S=null, st=null, GID=null, typing=false, full='', tm=null, wantPlay=null, started=false;
+
+function toast(m){const t=$('#toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',1600)}
 const fresh=()=>({pc:0,cur:0,bg:'#14122b',sprites:{},vars:{},log:[],bgm:null});
 const asset=f=>`/g/${GID}/`+f.split('/').map(encodeURIComponent).join('/');
-const fmt=b=>b>=1e9?(b/1e9).toFixed(2)+' GB':b>=1e6?(b/1e6).toFixed(1)+' MB':b>=1e3?Math.round(b/1e3)+' KB':b+' B';
-function toast(m){const t=$('#toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',1600)}
 
-function renderBg(fade){
-  const b=$('#bg'),v=st.bg,apply=()=>{
-    b.style.backgroundColor=v[0]==='#'?v:'#000';
-    b.style.backgroundImage=v[0]==='#'?'none':`url("${asset(v)}")`;
-  };
-  if(fade){b.classList.add('fx');setTimeout(()=>{apply();b.classList.remove('fx')},600)}else apply();
-}
-function renderSprites(){
-  const box=$('#sprites');box.innerHTML='';
-  for(const [n,s] of Object.entries(st.sprites)){
-    const d=document.createElement('div');d.className='sprite '+s.pos;
-    const img=new Image();img.src=asset(`${n}_${s.pose}.png`);img.alt=n;
-    img.onerror=()=>{const p=document.createElement('div');p.className='ph';p.textContent=n+' ('+s.pose+')';img.replaceWith(p)};
-    d.appendChild(img);box.appendChild(d);
-  }
-}
-function renderBgm(){
-  if(!st.bgm){bgm.pause();return}
-  const u=new URL(asset(st.bgm),location.href).href;
-  if(bgm.src!==u)bgm.src=u;
-  bgm.play().catch(()=>{});
-}
-function playSfx(f){const a=new Audio(asset(f));a.play().catch(()=>{});return a}
-
-function showText(who,text,instant){
+function showText(who,text){
   $('#who').textContent=who;
   const t=$('#text');clearInterval(tm);full=text;
-  if(instant||skip){t.textContent=text;typing=false;return afterText()}
   let i=0;typing=true;t.textContent='';
-  tm=setInterval(()=>{i++;t.textContent=full.slice(0,i);if(i>=full.length)finishType()},28);
+  tm=setInterval(()=>{i++;t.textContent=full.slice(0,i);if(i>=full.length){clearInterval(tm);typing=false}},28);
 }
-function finishType(){clearInterval(tm);$('#text').textContent=full;typing=false;afterText()}
-function afterText(){clearTimeout(autoT);if(auto&&!skip)autoT=setTimeout(next,1200+full.length*45)}
-const test=(a,op,b)=>({'==':a==b,'!=':a!=b,'>=':a>=b,'<=':a<=b,'>':a>b,'<':a<b})[op];
 
 function step(){
-  let guard=0;
-  while(st.pc<S.cmds.length&&guard++<10000){
-    const i=st.pc,c=S.cmds[st.pc++];
-    switch(c.t){
-      case 'say':st.cur=i;st.log.push({who:c.who,text:c.text});if(st.log.length>200)st.log.shift();showText(c.who,c.text);return;
-      case 'choice':st.cur=i;showChoices(c);return;
-      case 'bg':st.bg=c.v;renderBg(c.fade);break;
-      case 'show':st.sprites[c.name]={pose:c.pose,pos:c.pos};renderSprites();break;
-      case 'hide':delete st.sprites[c.name];renderSprites();break;
-      case 'bgm':st.bgm=c.v==='stop'?null:c.v;renderBgm();break;
-      case 'se':case 'voice':playSfx(c.v);break;
-      case 'set':st.vars[c.k]=c.op==='+='?(Number(st.vars[c.k])||0)+c.v:c.v;break;
-      case 'if':if(test(st.vars[c.k]??0,c.op,c.v))st.pc=S.labels[c.label];break;
-      case 'jump':st.pc=S.labels[c.label];break;
-      case 'end':finish();return;
-    }
+  if(st.pc<S.cmds.length){
+    const c=S.cmds[st.pc++];
+    if(c.t==='say'){showText(c.who,c.text);return}
+    if(c.t==='end'){finish();return}
   }
   finish();
 }
-function finish(){auto=skip=false;syncBtns();$('#ovEnd').style.display='block'}
-function showChoices(c){
-  choosing=true;skip=false;syncBtns();
-  const box=$('#choices');box.innerHTML='';box.style.display='flex';
-  c.options.forEach(o=>{
-    const b=document.createElement('button');b.className='opt';b.textContent=o.text;
-    b.onclick=e=>{e.stopPropagation();box.style.display='none';choosing=false;
-      st.log.push({who:'>',text:o.text});st.pc=S.labels[o.label];step()};
-    box.appendChild(b);
-  });
-  box.firstChild.focus();
-}
-const anyOverlay=()=>[...document.querySelectorAll('.ov')].some(o=>o.style.display==='block');
-function next(){if(!started||choosing||anyOverlay())return;if(typing){finishType();return}step()}
-function syncBtns(){$('#bAuto').classList.toggle('on',auto);$('#bSkip').classList.toggle('on',skip)}
-let skipT=null;
-function setSkip(v){
-  skip=v;clearInterval(skipT);
-  if(v){auto=false;skipT=setInterval(()=>{if(choosing||anyOverlay())return;typing&&finishType();step()},60)}
-  syncBtns();
-}
-
-const skey=n=>`vn:${GID}:slot${n}`;
-function slotUI(mode){
-  $('#slotTitle').textContent=mode==='save'?'Simpan ke slot':'Muat dari slot';
-  const body=$('#slotBody');body.innerHTML='';
-  for(let n=1;n<=6;n++){
-    let d=null;try{d=JSON.parse(localStorage.getItem(skey(n))||'null')}catch(e){}
-    const b=document.createElement('button');b.className='slot';
-    const last=d&&d.log&&d.log.length?d.log[d.log.length-1].text.slice(0,50):'';
-    b.textContent=`Slot ${n}: `+(d?(last||'(simpanan)'):'kosong');
-    b.onclick=()=>{
-      if(mode==='save'){
-        try{localStorage.setItem(skey(n),JSON.stringify(st));toast('Disimpan')}catch(e){toast('Gagal simpan')}
-      }else{
-        if(!d)return;
-        st=d;st.pc=st.cur;if(S.cmds[st.cur].t==='say')st.log.pop();
-        renderBg();renderSprites();renderBgm();$('#choices').style.display='none';choosing=false;
-        $('#ovEnd').style.display='none';toast('Dimuat');step();
-      }
-      $('#ovSlot').style.display='none';
-    };
-    body.appendChild(b);
-  }
-  $('#ovSlot').style.display='block';
-}
-function openLog(){
-  const b=$('#logBody');b.innerHTML='';
-  st.log.forEach(l=>{const p=document.createElement('p');
-    if(l.who){const s=document.createElement('b');s.textContent=l.who+': ';p.appendChild(s)}
-    p.appendChild(document.createTextNode(l.text));b.appendChild(p)});
-  $('#ovLog').style.display='block';
-}
-
-const rows={};let wantPlay=null,libTimer=null;
-const SRC={github:'GitHub',release:'GitHub Release',local:'Tempatan',cache:'Dalam cache',upload:'Diupload'};
-const libOpen=()=>$('#lib').style.display==='block';
-
-function makeRow(g){
-  const el=document.createElement('div');el.className='game';
-  el.innerHTML='<div><div class="gn"></div><div class="gm"></div></div><div class="acts"><button class="main"></button><button class="del">Padam cache</button><button class="dl">Simpan fail</button><button class="delgh del">Padam dari GitHub</button></div><div class="prog"><i></i></div>';
-  const r={el,gn:el.querySelector('.gn'),gm:el.querySelector('.gm'),main:el.querySelector('.main'),del:el.querySelector('.del'),delgh:el.querySelector('.delgh'),dl:el.querySelector('.dl'),prog:el.querySelector('.prog'),bar:el.querySelector('.prog i'),id:g.id,state:'none'};
-  r.main.onclick=()=>onMain(r.id,r.state);
-  r.del.onclick=()=>onDelete(r.id,r.gn.textContent);
-  r.delgh.onclick=()=>onDeleteGh(r.id,r.gn.textContent);
-  r.dl.onclick=()=>{const pw=$('#adminPw').value;location.href=`/api/games/${r.id}/archive`+(pw?'?pw='+encodeURIComponent(pw):'')};
-  $('#libList').appendChild(el);rows[g.id]=r;return r;
-}
-function updRow(g){
-  const r=rows[g.id]||makeRow(g);r.state=g.state;
-  r.gn.textContent=g.name;
-  const src=SRC[g.source]||g.source,pct=g.total?Math.min(100,Math.round(g.done*100/g.total)):0;
-  let m;r.gm.className='gm';
-  if(g.state==='downloading'){m=`Memuat turun ${fmt(g.done)}${g.total?' / '+fmt(g.total):''}${g.total?` (${pct}%)`:''}`}
-  else if(g.state==='extracting'){m='Mengekstrak fail...'}
-  else if(g.state==='ready'){m=`Dalam cache, ${fmt(g.cached_size)}`}
-  else if(g.state==='error'){m='Ralat: '+g.error;r.gm.className='gm err'}
-  else{m=(g.size?fmt(g.size)+', ':'')+src+', belum dimuat turun'}
-  r.gm.textContent=m;
-  const active=g.state==='downloading'||g.state==='extracting';
-  r.prog.style.display=active?'block':'none';
-  r.bar.style.width=(g.state==='extracting'?100:pct)+'%';
-  r.main.textContent=({none:'Muat turun & main',downloading:'Memuat turun...',extracting:'Mengekstrak...',ready:'Main',error:'Cuba lagi'})[g.state];
-  r.main.disabled=active;
-  r.dl.style.display=(['release','github','local'].includes(g.source)&&['none','ready'].includes(g.state))?'':'none';
-  r.del.textContent=g.state==='ready'?'Padam cache':'Buang';
-  r.del.style.display=(g.state==='ready'||g.state==='error')?'':'none';
-  r.del.disabled=active;
-  r.delgh.style.display=(g.source==='release'&&LIB.github_write&&!active)?'':'none';
-  r.delgh.disabled=active;
-}
-let LIB={};
-function renderLib(d){
-  LIB=d;
-  $('#libSub').textContent=d.repo?`Penyimpanan dari github.com/${d.repo}`:'Pengurus Fail Pakej';
-  $('#libErr').textContent=d.error||'';
-  $('#adminRow').style.display=d.locked?'block':'none';
-  const ids=new Set(d.games.map(g=>g.id));
-  for(const id of Object.keys(rows)) if(!ids.has(id)){rows[id].el.remove();delete rows[id]}
-  d.games.forEach(updRow);
-  $('#libEmpty').textContent=d.games.length?'':'Tiada game dijumpai.';
-  if(wantPlay){
-    const g=d.games.find(x=>x.id===wantPlay);
-    if(g&&g.state==='ready'){const id=wantPlay;wantPlay=null;playGame(id)}
-    else if(!g||g.state==='error'){wantPlay=null}
-  }
-}
-async function pollLib(force){
-  clearTimeout(libTimer);
-  let d=null;
-  try{d=await (await fetch('/api/games'+(force?'?refresh=1':''))).json();renderLib(d)}catch(e){$('#libErr').textContent='Gagal hubungi server.'}
-  if(libOpen()){
-    const active=d&&d.games.some(g=>g.state==='downloading'||g.state==='extracting');
-    libTimer=setTimeout(()=>pollLib(false),active?600:30000);
-  }
-}
-function openLib(){
-  setSkip(false);auto=false;syncBtns();
-  $('#lib').style.display='block';$('#bBack').style.display=started?'block':'none';pollLib(false);
-}
-async function onMain(id,state){
-  if(state==='ready'){playGame(id);return}
-  wantPlay=id;
-  const r=await fetch(`/api/games/${id}/download`,{method:'POST'});
-  if(!r.ok){wantPlay=null;toast((await r.json()).error||'Gagal')}
-  pollLib(false);
-}
-async function onDelete(id,name){
-  if(!confirm(`Padam "${name}" daripada server?`))return;
-  const r=await fetch(`/api/games/${id}/cache`,{method:'DELETE',headers:adminH()});
-  if(!r.ok)toast((await r.json()).error||'Gagal');else{toast('Cache dipadam');if(GID===id){started=false;GID=null;bgm.pause()}}
-  pollLib(false);
-}
-async function onDeleteGh(id,name){
-  if(!confirm(`Padam "${name}" dari GitHub?`))return;
-  const r=await fetch(`/api/games/${id}/github`,{method:'DELETE',headers:adminH()});
-  if(!r.ok)toast((await r.json()).error||'Gagal');else{toast('Dipadam dari GitHub');if(GID===id){started=false;GID=null;bgm.pause()}}
-  pollLib(true);
-}
-$('#bClearAll').onclick=async()=>{
-  if(!confirm('Padam semua cache?'))return;
-  const r=await fetch('/api/cache',{method:'DELETE',headers:adminH()});
-  if(!r.ok)toast((await r.json()).error||'Gagal');else{toast('Semua cache dipadam');started=false;GID=null;bgm.pause();$('#bBack').style.display='none'}
-  pollLib(false);
-};
-$('#bRefresh').onclick=()=>pollLib(true);
-
-$('#adminPw').value=sessionStorage.getItem('vn:admin')||'';
-$('#adminPw').oninput=e=>sessionStorage.setItem('vn:admin',e.target.value);
-function adminH(){const v=$('#adminPw').value;return v?{'X-Admin-Password':v}:{}}
-function upMsg(t,err){const m=$('#upMsg');m.textContent=t;m.className=err?'err':''}
-let uploading=false;
-function sendChunk(uid,off,blob,onProg){
-  return new Promise(res=>{
-    const x=new XMLHttpRequest();x.open('POST',`/api/upload/${uid}/chunk?offset=${off}`);
-    const h=adminH();for(const k in h)x.setRequestHeader(k,h[k]);
-    x.upload.onprogress=e=>onProg(e.loaded);
-    x.onload=()=>{let d={};try{d=JSON.parse(x.responseText)}catch(e){}res({status:x.status,d})};
-    x.onerror=()=>res({status:0,d:{}});x.ontimeout=x.onerror;
-    x.send(blob);
-  });
-}
-async function jpost(url,body){
-  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',...adminH()},body:body?JSON.stringify(body):undefined});
-  let d={};try{d=await r.json()}catch(e){}return{ok:r.ok,d};
-}
-async function upload(file){
-  if(uploading)return;
-  if(!/\.(zip|7z)$/i.test(file.name)){upMsg('Hanya fail .zip atau .7z diterima.',true);return}
-  uploading=true;upMsg('Menyediakan upload...');
-  const bar=$('#upProg i');$('#upProg').style.display='block';bar.style.width='0';
-  const stop=e=>{e.preventDefault();e.returnValue=''};window.addEventListener('beforeunload',stop);
-  const fail=m=>{upMsg(m,true);$('#upProg').style.display='none'};
-  try{
-    const ini=await jpost('/api/upload/init',{name:file.name,size:file.size});
-    if(!ini.ok){fail(ini.d.error||'Gagal memulakan upload.');return}
-    const uid=ini.d.uid,CH=ini.d.chunk;let off=0,tries=0;
-    while(off<file.size){
-      const end=Math.min(off+CH,file.size);
-      const r=await sendChunk(uid,off,file.slice(off,end),l=>{
-        const p=off+l;bar.style.width=Math.round(p*100/file.size)+'%';
-        upMsg(`Mengupload ${fmt(p)} / ${fmt(file.size)} (${Math.round(p*100/file.size)}%)`)});
-      if(r.status===200){off=end;tries=0;continue}
-      if(r.status===409&&typeof r.d.received==='number'){off=r.d.received;continue}
-      if(r.status===403||r.status===404||r.status===413){fail(r.d.error||'Ditolak.');return}
-      if(++tries>4){fail('Sambungan terputus.');return}
-      await new Promise(z=>setTimeout(z,1500*tries));
-    }
-    const fin=await jpost(`/api/upload/${uid}/finish`);
-    $('#upProg').style.display='none';
-    if(!fin.ok){upMsg(fin.d.error||'Gagal menamatkan upload.',true);return}
-    upMsg('Berjaya, mengekstrak...');wantPlay=fin.d.id;pollLib(false);
-  }finally{uploading=false;window.removeEventListener('beforeunload',stop)}
-}
-$('#bUp').onclick=()=>$('#fileIn').click();
-$('#fileIn').onchange=e=>{if(e.target.files[0])upload(e.target.files[0]);e.target.value=''};
-const dz=$('#drop');
-['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('over')}));
-['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('over')}));
-dz.addEventListener('drop',e=>{if(e.dataTransfer.files[0])upload(e.dataTransfer.files[0])});
-window.addEventListener('dragover',e=>e.preventDefault());window.addEventListener('drop',e=>e.preventDefault());
-$('#bBack').onclick=()=>{$('#lib').style.display='none';clearTimeout(libTimer)};
-$('#bLib').onclick=openLib;$('#bEndLib').onclick=()=>{$('#ovEnd').style.display='none';openLib()};
+function finish(){$('#ovEnd').style.display='block'}
+function next(){if(typing){clearInterval(tm);$('#text').textContent=full;typing=false;return}if(started)step()}
 
 async function playGame(id){
   const info=await (await fetch(`/api/games/${id}/scripts`)).json();
-  if(!info.scripts||!info.scripts.length){toast('Tiada skrip');return}
-  GID=id;await boot(info.scripts.includes('start')?'start':info.scripts[0]);
+  if(!info.scripts||!info.scripts.length)return;
+  GID=id;
+  const r=await fetch(`/api/games/${GID}/script/${encodeURIComponent(info.scripts[0])}`);
+  S=await r.json();
+  st=fresh();started=true;
+  $('#ovEnd').style.display='none';
+  $('#lib').style.display='none';
+  step();
 }
-async function boot(name){
-  const r=await fetch(`/api/games/${GID}/script/${encodeURIComponent(name)}`);S=await r.json();
-  if(S.error){alert('Ralat: '+S.error);return}
-  bgm.pause();bgm.removeAttribute('src');
-  clearInterval(tm);clearTimeout(autoT);setSkip(false);auto=false;syncBtns();
-  $('#choices').style.display='none';choosing=false;$('#ovEnd').style.display='none';
-  $('#lib').style.display='none';clearTimeout(libTimer);
-  st=fresh();started=true;renderBg();renderSprites();step();
-}
-$('#bRestart').onclick=()=>{$('#ovEnd').style.display='none';st=fresh();renderBg();renderSprites();renderBgm();step()};
 
-$('#stage').addEventListener('click',e=>{if(!e.target.closest('#bar,.ov,#choices'))next()});
-document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>b.parentElement.style.display='none');
-$('#bAuto').onclick=()=>{setSkip(false);auto=!auto;syncBtns();if(auto&&!typing)afterText()};
-$('#bSkip').onclick=()=>setSkip(!skip);
-$('#bLog').onclick=()=>started&&openLog();
-$('#bSave').onclick=()=>started&&slotUI('save');
-$('#bLoad').onclick=()=>started&&slotUI('load');
-document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'){document.querySelectorAll('.ov:not(#lib)').forEach(o=>o.style.display='none');if(started&&libOpen())$('#bBack').click()}
-  else if(e.key===' '||e.key==='Enter'){if(!['BUTTON','INPUT'].includes(document.activeElement.tagName)){e.preventDefault();next()}}
-  else if(e.key==='Control')setSkip(true);
-});
-document.addEventListener('keyup',e=>{if(e.key==='Control')setSkip(false)});
-pollLib(false);
+async function pollLib(){
+  const res=await fetch('/api/games');
+  const d=await res.json();
+  if(wantPlay){
+    const g=d.games.find(x=>x.id===wantPlay);
+    if(g&&g.state==='ready'){
+      const id=wantPlay; wantPlay=null;
+      toast('Berjaya! Membuka game...');
+      playGame(id);
+      return;
+    }
+  }
+  setTimeout(pollLib, 1000);
+}
+
+async function upload(file){
+  upMsg('Menyediakan muat naik...');
+  const bar=$('#upProg i');$('#upProg').style.display='block';
+  const ini=await (await fetch('/api/upload/init',{method:'POST',body:JSON.stringify({name:file.name,size:file.size})})).json();
+  const uid=ini.uid,CH=ini.chunk;let off=0;
+  while(off<file.size){
+    const end=Math.min(off+CH,file.size);
+    const resp=await fetch(`/api/upload/${uid}/chunk?offset=${off}`,{method:'POST',body:file.slice(off,end)});
+    const r=await resp.json();
+    if(resp.status===200){off=end;bar.style.width=Math.round(off*100/file.size)+'%';upMsg(`Memuat naik... ${Math.round(off*100/file.size)}%`);}
+    else{upMsg('Ralat muat naik.',true);break;}
+  }
+  const fin=await (await fetch(`/api/upload/${uid}/finish`,{method:'POST'})).json();
+  $('#upProg').style.display='none';
+  if(fin.id){
+    wantPlay=fin.id;
+    upMsg('Mengekstrak fail, bersedia untuk dibuka...');
+    pollLib();
+  }else{upMsg(fin.error||'Gagal.',true);}
+}
+
+$('#bUp').onclick=()=>$('#fileIn').click();
+$('#fileIn').onchange=e=>{if(e.target.files[0])upload(e.target.files[0])};
+$('#drop').ondragover=e=>e.preventDefault();
+$('#drop.drop'\vert{}\vert{}$('#drop')).ondrop=e=>{e.preventDefault();if(e.dataTransfer.files[0])upload(e.dataTransfer.files[0])};
+$('#bLib').onclick=()=>{$('#lib').style.display='block'};
+$('#bRestart').onclick=()=>{$('#ovEnd').style.display='none';st=fresh();step()};
+$('#stage').onclick=e=>{if(!e.target.closest('#bar,.ov'))next()};
+
+pollLib();
 </script></body></html>
 """
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")),
-            debug=os.environ.get("DEBUG") == "1", threaded=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)
