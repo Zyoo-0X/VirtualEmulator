@@ -374,6 +374,10 @@ def finalize(gid, job, tmp, apath, name, source, delete_archive=True):
         Path(apath).unlink()
     root = find_root(tmp / "files")
     if root is None:
+        base = tmp / "files"
+        if any(base.rglob("*.pfs")) or any(base.rglob("*.pfs.000")) or any(base.rglob("system.ini")):
+            raise ValueError("Ini game format Artemis (root.pfs). Enjin ini hanya menjalankan skrip .vn, "
+                             "jadi game ini tidak boleh dimainkan di sini.")
         raise ValueError("Tiada fail .vn dijumpai dalam arkib (letak skrip dalam scripts/ atau terus di root).")
     meta = {"name": name, "root": str(root.relative_to(tmp / "files")) or ".",
             "size": size, "time": int(time.time()), "source": source}
