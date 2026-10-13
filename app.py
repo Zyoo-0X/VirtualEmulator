@@ -402,7 +402,7 @@ def busy(gid):
     if not j:
         return False
     gh = j.get("gh") or {}
-    return j["state"] in ("downloading", "extracting") or gh.get("state"] in ("waiting", "uploading")
+    return j["state"] in ("downloading", "extracting") or gh.get("state") in ("waiting", "uploading")
 
 
 app = Flask(__name__)
@@ -849,7 +849,7 @@ async function onDelete(id,name){
 }
 
 $('#bRefresh').onclick=()=>pollLib();
-$('#bHome').onclick=>{$('#ovMain').style.display='block'};
+$('#bHome').onclick=()=>{$('#ovMain').style.display='block'};
 
 // Upload logic
 async function upload(file){
@@ -873,7 +873,6 @@ async function upload(file){
   if(fin.error){$('#upMsg').textContent=fin.error;return;}
   $('#upMsg').textContent='Upload selesai! Semak di tab Main Game.';
   wantPlay=fin.id;
-  // Beralih ke tab Main automatik
   document.querySelectorAll('.tab-btn')[0].click();
   pollLib();
 }
@@ -890,7 +889,6 @@ async function playGame(id){
   if(!info.scripts||!info.scripts.length){toast('Tiada skrip .vn');return}
   GID=id;
   $('#ovMain').style.display='none';
-  // Muatkan enjin permainan asas di sini jika perlu
   toast('Memuatkan permainan...');
 }
 
